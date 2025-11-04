@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Filter for USB Video Class (UVC) cameras -->
+    <!-- This allows the app to detect most USB cameras -->
+    <usb-device class="239" subclass="2" protocol="1" />
+
+    <!-- Common USB camera vendor IDs (add more as needed) -->
+    <!-- Generic UVC cameras -->
+    <usb-device vendor-id="1118" />  <!-- Microsoft -->
+    <usb-device vendor-id="1133" />  <!-- Logitech -->
+    <usb-device vendor-id="1452" />  <!-- Apple -->
+    <usb-device vendor-id="1871" />  <!-- Aveo Technology -->
+    <usb-device vendor-id="1908" />  <!-- GEMBIRD -->
+    <usb-device vendor-id="1443" />  <!-- Innomedia -->
+
+    <!-- Add your Hawkeye camera vendor ID here when known -->
+    <!-- <usb-device vendor-id="XXXX" product-id="XXXX" /> -->
+</resources>

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Hawkeye Brand Colors (matching Windows app) -->
+    <color name="hawkeye_primary">#e74c3c</color>
+    <color name="hawkeye_primary_dark">#c0392b</color>
+    <color name="hawkeye_accent">#e74c3c</color>
+
+    <!-- Dark Theme (matching Windows app) -->
+    <color name="background_dark">#0f0f10</color>
+    <color name="surface_dark">#1b1b1b</color>
+    <color name="surface_elevated">#262626</color>
+    <color name="border_dark">#242424</color>
+
+    <!-- Text Colors -->
+    <color name="text_primary">#ffffff</color>
+    <color name="text_secondary">#cfcfcf</color>
+    <color name="text_tertiary">#9aa</color>
+    <color name="text_value">#837E7C</color>
+
+    <!-- Status Colors -->
+    <color name="status_ok">#79d08a</color>
+    <color name="status_warn">#f5a97f</color>
+    <color name="status_error">#e74c3c</color>
+
+    <!-- Grid Colors -->
+    <color name="grid_red">#ff3b3b</color>
+    <color name="grid_white">#ffffff</color>
+    <color name="grid_black">#000000</color>
+</resources>

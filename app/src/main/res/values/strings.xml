@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Hawkeye Viewer</string>
+
+    <!-- Camera Controls -->
+    <string name="btn_start">Start</string>
+    <string name="btn_stop">Stop</string>
+    <string name="btn_refresh">Refresh</string>
+    <string name="btn_capture">Capture</string>
+    <string name="btn_record">Record</string>
+    <string name="btn_settings">Settings</string>
+
+    <!-- Settings -->
+    <string name="brightness">Brightness</string>
+    <string name="contrast">Contrast</string>
+    <string name="saturation">Saturation</string>
+    <string name="hue">Hue</string>
+    <string name="gamma">Gamma</string>
+    <string name="sharpness">Sharpness</string>
+    <string name="zoom">Zoom</string>
+
+    <!-- Aspect Ratios -->
+    <string name="aspect_wide">Wide (16:9)</string>
+    <string name="aspect_4_3">4:3</string>
+    <string name="aspect_1_1">1:1 (Square)</string>
+
+    <!-- Messages -->
+    <string name="no_camera">No camera detected</string>
+    <string name="connect_camera">Please connect a USB camera</string>
+    <string name="camera_started">Camera started</string>
+    <string name="camera_stopped">Camera stopped</string>
+    <string name="image_saved">Image saved</string>
+    <string name="video_recording">Recording…</string>
+    <string name="video_saved">Video saved</string>
+
+    <!-- Permissions -->
+    <string name="permission_camera">Camera permission is required to use the borescope</string>
+    <string name="permission_storage">Storage permission is required to save images and videos</string>
+</resources>
