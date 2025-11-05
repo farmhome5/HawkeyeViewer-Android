@@ -76,9 +76,9 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:1.3.1")
     implementation("androidx.camera:camera-view:1.3.1")
 
-    // USB UVC Camera support
-    implementation("com.serenegiant:common:8.7.0")
-    implementation("com.serenegiant:libuvccamera:2.15.1")
+    // USB Serial support (more reliable, on Maven Central)
+    //implementation("com.github.mik3y:usb-serial-for-android:3.7.3")
+   // implementation("com.github.jiangdongguo:AndroidUSBCamera:3.2.8")
 
     // Leanback for Android TV
     "tvImplementation"("androidx.leanback:leanback:1.0.0")
