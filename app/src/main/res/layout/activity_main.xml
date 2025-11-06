@@ -8,8 +8,8 @@
     android:background="@color/background_dark"
     tools:context=".MainActivity">
 
-    <!-- Camera Preview Surface -->
-    <com.serenegiant.widget.UVCCameraTextureView
+    <!-- Camera Preview Surface - Will use TextureView until UVC camera is integrated -->
+    <TextureView
         android:id="@+id/cameraView"
         android:layout_width="0dp"
         android:layout_height="0dp"

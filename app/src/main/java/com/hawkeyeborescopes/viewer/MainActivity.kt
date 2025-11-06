@@ -2,23 +2,16 @@ package com.hawkeyeborescopes.viewer
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.hardware.usb.UsbDevice
 import android.os.Bundle
 import android.view.View
-import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.hawkeyeborescopes.viewer.databinding.ActivityMainBinding
-import com.serenegiant.usb.CameraDialog
-import com.serenegiant.usb.USBMonitor
-import com.serenegiant.usb.UVCCamera
 
-class MainActivity : AppCompatActivity(), CameraDialog.CameraDialogParent {
+class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
-    private var usbMonitor: USBMonitor? = null
-    private var uvcCamera: UVCCamera? = null
     private var isActive = false
     private var isPreviewing = false
 
@@ -35,7 +28,7 @@ class MainActivity : AppCompatActivity(), CameraDialog.CameraDialogParent {
 
         setupUI()
         checkPermissions()
-        initUSBMonitor()
+        showStatus("App ready - Camera integration coming soon")
     }
 
     private fun setupUI() {
@@ -53,24 +46,22 @@ class MainActivity : AppCompatActivity(), CameraDialog.CameraDialogParent {
 
         // Start camera button
         binding.startButton.setOnClickListener {
-            if (!isActive && !isPreviewing) {
-                usbMonitor?.requestPermission(getUSBDevice())
-            }
+            showStatus("Camera integration coming soon - will be added in Codespaces")
         }
 
         // Stop camera button
         binding.stopButton.setOnClickListener {
-            stopPreview()
+            showStatus("Camera stop - coming soon")
         }
 
         // Capture button
         binding.captureButton.setOnClickListener {
-            captureImage()
+            showStatus("Image capture - coming soon")
         }
 
         // Record button
         binding.recordButton.setOnClickListener {
-            toggleRecording()
+            showStatus("Video recording - coming soon")
         }
     }
 
@@ -94,105 +85,6 @@ class MainActivity : AppCompatActivity(), CameraDialog.CameraDialogParent {
         }
     }
 
-    private fun initUSBMonitor() {
-        usbMonitor = USBMonitor(this, onDeviceConnectListener)
-        usbMonitor?.register()
-    }
-
-    private val onDeviceConnectListener = object : USBMonitor.OnDeviceConnectListener {
-        override fun onAttach(device: UsbDevice?) {
-            showStatus("USB device attached: ${device?.deviceName}")
-        }
-
-        override fun onConnect(
-            device: UsbDevice?,
-            ctrlBlock: USBMonitor.UsbControlBlock?,
-            createNew: Boolean
-        ) {
-            showStatus("USB device connected")
-            startPreview(ctrlBlock)
-        }
-
-        override fun onDisconnect(device: UsbDevice?, ctrlBlock: USBMonitor.UsbControlBlock?) {
-            showStatus("USB device disconnected")
-            stopPreview()
-        }
-
-        override fun onDetach(device: UsbDevice?) {
-            showStatus("USB device detached")
-        }
-
-        override fun onCancel(device: UsbDevice?) {
-            showStatus("USB permission cancelled")
-        }
-    }
-
-    private fun getUSBDevice(): UsbDevice? {
-        val list = usbMonitor?.deviceList
-        return list?.firstOrNull()
-    }
-
-    private fun startPreview(ctrlBlock: USBMonitor.UsbControlBlock?) {
-        if (ctrlBlock == null || isPreviewing) return
-
-        try {
-            uvcCamera = UVCCamera()
-            uvcCamera?.open(ctrlBlock)
-
-            // Set preview size
-            uvcCamera?.setPreviewSize(
-                PREVIEW_WIDTH,
-                PREVIEW_HEIGHT,
-                UVCCamera.FRAME_FORMAT_MJPEG
-            )
-
-            // Set surface for preview
-            uvcCamera?.setPreviewDisplay(binding.cameraView.surfaceTexture)
-            uvcCamera?.startPreview()
-
-            isPreviewing = true
-            isActive = true
-            showStatus("Camera started")
-
-        } catch (e: Exception) {
-            showStatus("Error starting camera: ${e.message}")
-            e.printStackTrace()
-        }
-    }
-
-    private fun stopPreview() {
-        try {
-            uvcCamera?.stopPreview()
-            uvcCamera?.close()
-            uvcCamera?.destroy()
-            uvcCamera = null
-            isPreviewing = false
-            isActive = false
-            showStatus("Camera stopped")
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-
-    private fun captureImage() {
-        if (!isPreviewing) {
-            showStatus("Start camera first")
-            return
-        }
-
-        // TODO: Implement image capture
-        showStatus("Image capture - Coming soon")
-    }
-
-    private fun toggleRecording() {
-        if (!isPreviewing) {
-            showStatus("Start camera first")
-            return
-        }
-
-        // TODO: Implement video recording
-        showStatus("Video recording - Coming soon")
-    }
 
     private fun showStatus(message: String) {
         runOnUiThread {
@@ -206,20 +98,7 @@ class MainActivity : AppCompatActivity(), CameraDialog.CameraDialogParent {
 
     override fun onDestroy() {
         super.onDestroy()
-        stopPreview()
-        usbMonitor?.unregister()
-        usbMonitor?.destroy()
-    }
-
-    // CameraDialog.CameraDialogParent implementation
-    override fun getUSBMonitor(): USBMonitor? {
-        return usbMonitor
-    }
-
-    override fun onDialogResult(canceled: Boolean) {
-        if (!canceled) {
-            showStatus("Please grant USB permission")
-        }
+        // Camera cleanup will be added later
     }
 
     override fun onRequestPermissionsResult(
