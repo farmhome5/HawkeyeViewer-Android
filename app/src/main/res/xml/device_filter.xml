@@ -15,4 +15,8 @@
 
     <!-- Hawkeye borescope camera -->
     <usb-device vendor-id="3039" product-id="32886" />
+
+    <!-- ENDO-CAM (4e45:5501) - declares bDeviceClass=0 so the UVC class filter above
+         doesn't match; must be matched by VID/PID. UVC class is only on the interface. -->
+    <usb-device vendor-id="20037" product-id="21761" />
 </resources>
