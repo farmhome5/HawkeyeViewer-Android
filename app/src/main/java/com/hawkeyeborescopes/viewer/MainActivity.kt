@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
+import android.graphics.Outline
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.hardware.usb.UsbDevice
@@ -18,6 +19,7 @@ import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
 import android.widget.ImageView
 import android.widget.SeekBar
 import android.widget.Toast
@@ -50,6 +52,7 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.min
 
 class MainActivity : CameraActivity() {
 
@@ -99,6 +102,16 @@ class MainActivity : CameraActivity() {
     private var currentStripSection = StripSection.IMAGE
     private var currentImageControlIndex = 0
 
+    // Circular mask over the preview, for mirror-tube use. Off by default so
+    // non-mirror-tube scopes keep the current unmasked view.
+    // maskRadiusRef is in px of a 720-tall reference frame, the same units as
+    // the Windows viewer's Mask Radius slider (100..360, 360 = inscribed circle).
+    private var maskOn = false
+    private var maskRadiusRef = MASK_RADIUS_DEFAULT
+
+    // Guards the two UI copies (panel + strip) against listener feedback loops.
+    private var maskUiSyncing = false
+
     private val previewDataCallback = object : IPreviewDataCallBack {
         override fun onPreviewData(data: ByteArray?, width: Int, height: Int, format: IPreviewDataCallBack.DataFormat) {
             if (data == null) {
@@ -132,6 +145,16 @@ class MainActivity : CameraActivity() {
         private const val MAX_PREVIEW_FRAME_AGE_MS = 1_000L
         private const val CAPTURE_FEEDBACK_DURATION_MS = 350L
         private const val MAX_VISIBLE_HARDWARE_CAPTURE_AGE_MS = 2_000L
+
+        // Mask radius is expressed in px of a 720-tall reference frame so the
+        // numbers match the Windows viewer's Mask Radius slider one-for-one.
+        private const val MASK_REF_HEIGHT = 720f
+        private const val MASK_RADIUS_MIN = 100
+        private const val MASK_RADIUS_MAX = 360
+        private const val MASK_RADIUS_DEFAULT = 280
+        private const val MASK_PREFS_NAME = "image_adjustments"
+        private const val PREF_MASK_ON = "mask_on"
+        private const val PREF_MASK_RADIUS = "mask_radius"
     }
 
     private fun writeLog(message: String) {
@@ -387,6 +410,8 @@ class MainActivity : CameraActivity() {
                 applyAspectType(aspectRatioTypes[pos])
             }
         }
+        // Keep the mask circle correct across rotation
+        applyMask()
     }
 
     override fun onStart() {
@@ -433,6 +458,7 @@ class MainActivity : CameraActivity() {
         setupCameraControls()
         setupImageControls()
         setupTransformControls()
+        setupMaskControls()
         setupCollapsibleSections()
         setupZoomPan()
 
@@ -1178,6 +1204,130 @@ class MainActivity : CameraActivity() {
         }
         writeLog("Setting transform: $rotateType (mirror=$mirror, flip=$flip)")
         setRotateType(rotateType)
+    }
+
+    // ==================== Circular mask (mirror-tube) ====================
+
+    /**
+     * Wires the mask controls. These exist twice: in the tablet settings panel
+     * and in the phone adjust strip (the phone's Settings button opens the strip,
+     * not the panel, so the strip copy is the one that matters on a handset).
+     * Both drive the same state, and syncMaskUi pushes it back to both.
+     */
+    private fun setupMaskControls() {
+        restoreMaskSettings()
+
+        val toggle = { _: android.widget.CompoundButton, checked: Boolean ->
+            if (!maskUiSyncing) setMaskEnabled(checked)
+        }
+        binding.maskModeCheckBox.setOnCheckedChangeListener(toggle)
+        binding.stripMaskCheckBox?.setOnCheckedChangeListener(toggle)
+
+        // SeekBar has no android:min below API 26, so the bar runs 0..260 and
+        // MASK_RADIUS_MIN is added to get the 100..360 slider value.
+        val radiusListener = object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (!fromUser || maskUiSyncing) return
+                setMaskRadius(progress + MASK_RADIUS_MIN)
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) { saveMaskSettings() }
+        }
+        binding.maskRadiusSeekBar.setOnSeekBarChangeListener(radiusListener)
+        binding.stripMaskRadiusSeekBar?.setOnSeekBarChangeListener(radiusListener)
+
+        // The container is resized by aspect-ratio changes as well as rotation;
+        // re-query the outline whenever its bounds move so the circle follows.
+        binding.cameraContainer.addOnLayoutChangeListener { _, l, t, r, b, ol, ot, or, ob ->
+            if (maskOn && (r - l != or - ol || b - t != ob - ot)) {
+                binding.cameraContainer.invalidateOutline()
+            }
+        }
+
+        syncMaskUi()
+        applyMask()
+    }
+
+    /**
+     * Applies (or clears) the circular clip on the preview container.
+     *
+     * Clipping the container rather than the TextureView is deliberate: zoom,
+     * pan, crop and mirror/flip are all GL-side in this app (see
+     * base_vertex.glsl), so the container is never itself transformed. The
+     * circle therefore stays put while the image zooms and pans underneath it,
+     * like a real scope. UI thread only.
+     */
+    private fun applyMask() {
+        val container = binding.cameraContainer
+        if (!maskOn) {
+            container.clipToOutline = false
+            container.outlineProvider = ViewOutlineProvider.BACKGROUND
+            container.invalidateOutline()
+            return
+        }
+        container.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(view: View, outline: Outline) {
+                val w = view.width
+                val h = view.height
+                if (w <= 0 || h <= 0) {
+                    outline.setRect(0, 0, w, h)
+                    return
+                }
+                // Radius scales off the shorter side so the circle always fits.
+                val r = (min(w, h) * (maskRadiusRef / MASK_REF_HEIGHT)).toInt()
+                    .coerceIn(1, min(w, h) / 2)
+                val cx = w / 2
+                val cy = h / 2
+                outline.setOval(cx - r, cy - r, cx + r, cy + r)
+            }
+        }
+        container.clipToOutline = true
+        container.invalidateOutline()
+    }
+
+    private fun setMaskEnabled(on: Boolean) {
+        maskOn = on
+        applyMask()
+        syncMaskUi()
+        saveMaskSettings()
+        writeLog("Mask ${if (on) "on" else "off"} (radius=$maskRadiusRef)")
+    }
+
+    private fun setMaskRadius(value: Int) {
+        maskRadiusRef = value.coerceIn(MASK_RADIUS_MIN, MASK_RADIUS_MAX)
+        applyMask()
+        syncMaskUi()
+    }
+
+    /** Pushes mask state into both UI copies without re-entering listeners. */
+    private fun syncMaskUi() {
+        maskUiSyncing = true
+        try {
+            binding.maskModeCheckBox.isChecked = maskOn
+            binding.stripMaskCheckBox?.isChecked = maskOn
+
+            val progress = maskRadiusRef - MASK_RADIUS_MIN
+            binding.maskRadiusSeekBar.progress = progress
+            binding.stripMaskRadiusSeekBar?.progress = progress
+            binding.maskRadiusValue.text = maskRadiusRef.toString()
+            binding.stripMaskRadiusValue?.text = maskRadiusRef.toString()
+        } finally {
+            maskUiSyncing = false
+        }
+    }
+
+    private fun saveMaskSettings() {
+        getSharedPreferences(MASK_PREFS_NAME, MODE_PRIVATE).edit()
+            .putBoolean(PREF_MASK_ON, maskOn)
+            .putInt(PREF_MASK_RADIUS, maskRadiusRef)
+            .apply()
+    }
+
+    private fun restoreMaskSettings() {
+        val prefs = getSharedPreferences(MASK_PREFS_NAME, MODE_PRIVATE)
+        maskOn = prefs.getBoolean(PREF_MASK_ON, false)
+        maskRadiusRef = prefs.getInt(PREF_MASK_RADIUS, MASK_RADIUS_DEFAULT)
+            .coerceIn(MASK_RADIUS_MIN, MASK_RADIUS_MAX)
     }
 
     private fun setupCollapsibleSections() {
@@ -2005,6 +2155,9 @@ private fun showStillCapturedFeedback() {
         controlRow?.visibility = if (section == StripSection.IMAGE) View.VISIBLE else View.GONE
         cameraContent?.visibility = if (section == StripSection.CAMERA) View.VISIBLE else View.GONE
         transformContent?.visibility = if (section == StripSection.TRANSFORM) View.VISIBLE else View.GONE
+        // Mask controls ride along with the CAM tab
+        binding.stripMaskContent?.visibility =
+            if (section == StripSection.CAMERA) View.VISIBLE else View.GONE
 
         if (section == StripSection.IMAGE) {
             updateStripImageControl()
