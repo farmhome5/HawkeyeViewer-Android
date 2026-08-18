@@ -394,63 +394,6 @@
                         android:popupBackground="@color/surface_dark"
                         android:focusable="true"
                         android:focusableInTouchMode="true" />
-
-                    <!-- ===== Mask (mirror-tube circular clip) ===== -->
-                    <View
-                        android:layout_width="match_parent"
-                        android:layout_height="1dp"
-                        android:background="@color/border_dark"
-                        android:layout_marginTop="12dp" />
-
-                    <CheckBox
-                        android:id="@+id/maskModeCheckBox"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="Mask (circular)"
-                        android:textColor="@color/text_secondary"
-                        android:textSize="12sp"
-                        android:layout_marginTop="8dp" />
-
-                    <!-- Mask Radius: 100..360 in px of a 720 reference frame, the
-                         same units as the Windows viewer's Mask Radius slider.
-                         SeekBar has no android:min below API 26, so max=260 and
-                         the code adds MASK_RADIUS_MIN. -->
-                    <LinearLayout
-                        android:id="@+id/maskRadiusRow"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:orientation="horizontal"
-                        android:gravity="center_vertical"
-                        android:padding="4dp"
-                        android:background="@drawable/bg_seekbar_row"
-                        android:layout_marginTop="4dp">
-
-                        <TextView
-                            android:layout_width="100dp"
-                            android:layout_height="wrap_content"
-                            android:text="Mask Radius"
-                            android:textColor="@color/text_secondary"
-                            android:textSize="12sp" />
-
-                        <SeekBar
-                            android:id="@+id/maskRadiusSeekBar"
-                            android:layout_width="0dp"
-                            android:layout_height="wrap_content"
-                            android:layout_weight="1"
-                            android:max="260"
-                            android:progress="180"
-                            android:progressTint="@color/hawkeye_primary"
-                            android:thumbTint="@color/hawkeye_primary" />
-
-                        <TextView
-                            android:id="@+id/maskRadiusValue"
-                            android:layout_width="40dp"
-                            android:layout_height="wrap_content"
-                            android:text="280"
-                            android:textColor="@color/text_value"
-                            android:textSize="12sp"
-                            android:gravity="end" />
-                    </LinearLayout>
                 </LinearLayout>
 
                 <!-- IMAGE Section -->
@@ -781,6 +724,63 @@
                     android:layout_height="wrap_content"
                     android:orientation="vertical"
                     android:padding="10dp">
+
+                    <!-- ===== Mirror Tube Mode: circular mask + auto mirror ===== -->
+                    <View
+                        android:layout_width="match_parent"
+                        android:layout_height="1dp"
+                        android:background="@color/border_dark"
+                        android:layout_marginTop="12dp" />
+
+                    <CheckBox
+                        android:id="@+id/mirrorTubeCheckBox"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Mirror Tube Mode"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="12sp"
+                        android:layout_marginTop="8dp" />
+
+                    <!-- Mask Radius: 100..360 in px of a 720 reference frame, the
+                         same units as the Windows viewer's Mask Radius slider.
+                         SeekBar has no android:min below API 26, so max=260 and
+                         the code adds MASK_RADIUS_MIN. -->
+                    <LinearLayout
+                        android:id="@+id/maskRadiusRow"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical"
+                        android:padding="4dp"
+                        android:background="@drawable/bg_seekbar_row"
+                        android:layout_marginTop="4dp">
+
+                        <TextView
+                            android:layout_width="100dp"
+                            android:layout_height="wrap_content"
+                            android:text="Mask Radius"
+                            android:textColor="@color/text_secondary"
+                            android:textSize="12sp" />
+
+                        <SeekBar
+                            android:id="@+id/maskRadiusSeekBar"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:max="260"
+                            android:progress="180"
+                            android:progressTint="@color/hawkeye_primary"
+                            android:thumbTint="@color/hawkeye_primary" />
+
+                        <TextView
+                            android:id="@+id/maskRadiusValue"
+                            android:layout_width="40dp"
+                            android:layout_height="wrap_content"
+                            android:text="280"
+                            android:textColor="@color/text_value"
+                            android:textSize="12sp"
+                            android:gravity="end" />
+                    </LinearLayout>
 
                     <!-- Mirror and Flip -->
                     <LinearLayout

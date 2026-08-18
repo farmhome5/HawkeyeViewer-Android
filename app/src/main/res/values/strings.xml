@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Hawkeye Viewer</string>
+    <string name="app_name">Hawkeye Viewer Plus with Mask</string>
 
     <!-- Header Buttons -->
     <string name="btn_still">STILL</string>

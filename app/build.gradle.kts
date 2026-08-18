@@ -12,7 +12,7 @@ android {
         minSdk = 24  // Android 7.0 - good balance for UVC camera support
         targetSdk = 34
         versionCode = 1
-        versionName = "1.0.0"
+        versionName = "1.0.0-mask"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

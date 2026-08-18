@@ -112,6 +112,11 @@ class MainActivity : CameraActivity() {
     // Guards the two UI copies (panel + strip) against listener feedback loops.
     private var maskUiSyncing = false
 
+    // Mirror Tube Mode auto-enables horizontal mirror. These track ownership so
+    // turning the mode off only undoes the mirror it set itself, never a manual one.
+    private var mtmAutoEnabledMirror = false
+    private var mirrorSetByMode = false
+
     private val previewDataCallback = object : IPreviewDataCallBack {
         override fun onPreviewData(data: ByteArray?, width: Int, height: Int, format: IPreviewDataCallBack.DataFormat) {
             if (data == null) {
@@ -1178,6 +1183,11 @@ class MainActivity : CameraActivity() {
         // Mirror checkbox (horizontal flip)
         binding.mirrorCheckBox.setOnCheckedChangeListener { _, isChecked ->
             writeLog("Mirror: $isChecked")
+            // A manual mirror change means Mirror Tube Mode no longer owns it, so
+            // switching the mode off later must not undo the operator's choice.
+            if (!mirrorSetByMode) {
+                mtmAutoEnabledMirror = false
+            }
             saveImageControls()
             updateTransform()
             updateCaptureAdjustmentApplier()
@@ -1218,10 +1228,10 @@ class MainActivity : CameraActivity() {
         restoreMaskSettings()
 
         val toggle = { _: android.widget.CompoundButton, checked: Boolean ->
-            if (!maskUiSyncing) setMaskEnabled(checked)
+            if (!maskUiSyncing) setMirrorTubeMode(checked)
         }
-        binding.maskModeCheckBox.setOnCheckedChangeListener(toggle)
-        binding.stripMaskCheckBox?.setOnCheckedChangeListener(toggle)
+        binding.mirrorTubeCheckBox.setOnCheckedChangeListener(toggle)
+        binding.stripMirrorTubeCheckBox?.setOnCheckedChangeListener(toggle)
 
         // SeekBar has no android:min below API 26, so the bar runs 0..260 and
         // MASK_RADIUS_MIN is added to get the 100..360 slider value.
@@ -1285,12 +1295,54 @@ class MainActivity : CameraActivity() {
         container.invalidateOutline()
     }
 
-    private fun setMaskEnabled(on: Boolean) {
+    /**
+     * Mirror Tube Mode: lays the circular mask over the live image and turns on
+     * horizontal mirror, because the mode is for use with a mirror or prism
+     * adapter, which reverses the view.
+     *
+     * Mirrors the Windows viewer's semantics exactly, including the subtle part:
+     * enabling the mode only auto-sets Mirror if it was off, and disabling the
+     * mode only un-sets Mirror if the mode was what turned it on. If the operator
+     * takes manual control of Mirror at any point, the mode stops claiming it and
+     * leaves their choice alone.
+     */
+    private fun setMirrorTubeMode(on: Boolean) {
         maskOn = on
+        if (on) {
+            if (!binding.mirrorCheckBox.isChecked) {
+                mtmAutoEnabledMirror = true
+                setMirrorChecked(true)
+            } else {
+                mtmAutoEnabledMirror = false
+            }
+        } else if (mtmAutoEnabledMirror) {
+            mtmAutoEnabledMirror = false
+            setMirrorChecked(false)
+        }
         applyMask()
         syncMaskUi()
         saveMaskSettings()
-        writeLog("Mask ${if (on) "on" else "off"} (radius=$maskRadiusRef)")
+        writeLog(
+            "Mirror Tube Mode ${if (on) "on" else "off"} " +
+                "(radius=$maskRadiusRef mirror=${binding.mirrorCheckBox.isChecked})"
+        )
+    }
+
+    /**
+     * Sets the mirror checkboxes without the change being read as manual input,
+     * so the mode keeps ownership of the mirror it set.
+     */
+    private fun setMirrorChecked(checked: Boolean) {
+        mirrorSetByMode = true
+        try {
+            // The panel checkbox's own listener persists the setting and pushes the
+            // transform to the renderer; the strip copy then sees a matching panel
+            // value and no-ops, so this does not recurse.
+            binding.mirrorCheckBox.isChecked = checked
+            binding.stripMirrorCheckBox?.isChecked = checked
+        } finally {
+            mirrorSetByMode = false
+        }
     }
 
     private fun setMaskRadius(value: Int) {
@@ -1303,8 +1355,8 @@ class MainActivity : CameraActivity() {
     private fun syncMaskUi() {
         maskUiSyncing = true
         try {
-            binding.maskModeCheckBox.isChecked = maskOn
-            binding.stripMaskCheckBox?.isChecked = maskOn
+            binding.mirrorTubeCheckBox.isChecked = maskOn
+            binding.stripMirrorTubeCheckBox?.isChecked = maskOn
 
             val progress = maskRadiusRef - MASK_RADIUS_MIN
             binding.maskRadiusSeekBar.progress = progress
@@ -2155,9 +2207,9 @@ private fun showStillCapturedFeedback() {
         controlRow?.visibility = if (section == StripSection.IMAGE) View.VISIBLE else View.GONE
         cameraContent?.visibility = if (section == StripSection.CAMERA) View.VISIBLE else View.GONE
         transformContent?.visibility = if (section == StripSection.TRANSFORM) View.VISIBLE else View.GONE
-        // Mask controls ride along with the CAM tab
-        binding.stripMaskContent?.visibility =
-            if (section == StripSection.CAMERA) View.VISIBLE else View.GONE
+        // Mirror Tube Mode lives with mirror/flip, so it rides the XFM tab
+        binding.stripMirrorTubeContent?.visibility =
+            if (section == StripSection.TRANSFORM) View.VISIBLE else View.GONE
 
         if (section == StripSection.IMAGE) {
             updateStripImageControl()
