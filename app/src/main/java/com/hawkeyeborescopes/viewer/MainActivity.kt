@@ -129,6 +129,7 @@ class MainActivity : CameraActivity() {
     // One-shot: raw-frame spot metering misalignment warning, reset on each tap.
     @Volatile private var rawSpotWarningIssued = false
     private var lastMeterLogMs = 0L
+    private var meterRevertCount = 0
 
     private val previewDataCallback = object : IPreviewDataCallBack {
         override fun onPreviewData(data: ByteArray?, width: Int, height: Int, format: IPreviewDataCallBack.DataFormat) {
@@ -183,12 +184,15 @@ class MainActivity : CameraActivity() {
         private val METER_LABELS = listOf("Off", "Spot (tap preview)", "Center disc", "Edge annulus")
         private const val LUMA_DEADBAND = 8          // no correction inside target +/- this
         private const val METER_EVERY_N_FRAMES = 5   // control step every N frames
-        private const val METER_MAX_STEP = 6         // max brightness units per step
+        private const val METER_MAX_STEP = 12        // max brightness units per step
         private const val LUMA_SUBSAMPLE = 4         // sample every Nth pixel per axis
         private const val BRIGHTNESS_MIN = 0
         private const val BRIGHTNESS_MAX = 100
         private const val BRIGHTNESS_DEFAULT = 50
         private const val METER_LOG_INTERVAL_MS = 500L
+        private const val CONTROL_READBACK_TOLERANCE = 2
+        private const val EXPOSURE_PROBE_STREAMING_DELAY_MS = 6_000L
+        private const val METER_REVERT_ALERT_AFTER = 10
 
         // The RGBA preview buffer comes from glReadPixels, whose origin is
         // bottom-left, so buffer row 0 is the bottom of the displayed image.
@@ -301,9 +305,15 @@ class MainActivity : CameraActivity() {
                 updateTransform()
                 addPreviewDataCallBack(previewDataCallback)
 
-                // One-shot: does this camera actually respond to the exposure
-                // controls the metering loop drives?
-                probeExposureControls()
+                // Does this camera actually respond to the exposure controls the
+                // metering loop drives? Probe twice: once now, and again once the
+                // stream is running, because a camera whose auto-exposure owns the
+                // brightness register accepts writes at open and reverts them
+                // during streaming. The two results tell those cases apart.
+                probeExposureControls("at-open")
+                zoomOverlayHandler.postDelayed({
+                    probeExposureControls("streaming")
+                }, EXPOSURE_PROBE_STREAMING_DELAY_MS)
 
                 // Log storage location
                 if (isUsingRemovableStorage()) {
@@ -1678,7 +1688,7 @@ class MainActivity : CameraActivity() {
                 logMeterThrottled("stepBrightness: getBrightness() null — control unavailable")
                 return
             }
-            var delta = (error / 8).coerceIn(-METER_MAX_STEP, METER_MAX_STEP)
+            var delta = (error / 4).coerceIn(-METER_MAX_STEP, METER_MAX_STEP)
             if (delta == 0) delta = if (error > 0) 1 else -1
             val next = (current + delta).coerceIn(BRIGHTNESS_MIN, BRIGHTNESS_MAX)
             if (next == current) {
@@ -1694,11 +1704,28 @@ class MainActivity : CameraActivity() {
             }
             camera.setBrightness(next)
             val readBack = camera.getBrightness()
+            val took = readBack != null && abs(readBack - next) <= CONTROL_READBACK_TOLERANCE
+            if (took) {
+                meterRevertCount = 0
+            } else {
+                meterRevertCount++
+            }
             logMeterThrottled(
                 "stepBrightness: luma=$meanLuma err=$error " +
                     "brightness $current -> $next, read back $readBack" +
-                    if (readBack != next) "  << DID NOT TAKE" else ""
+                    if (took) "" else "  << REVERTED (${meterRevertCount}x)"
             )
+            if (meterRevertCount >= METER_REVERT_ALERT_AFTER) {
+                // The camera is taking the write and putting it straight back. With
+                // no auto-exposure control exposed by this library there is nothing
+                // further software can do to the sensor.
+                runOnUiThread {
+                    updateMeterStatus(
+                        "luma $meanLuma · camera rejects brightness (AE override)"
+                    )
+                }
+                return
+            }
             postMeterStatus(meanLuma, next, settled = false)
         } catch (e: Exception) {
             writeLog("stepBrightness: EXCEPTION - ${e.message}")
@@ -1722,22 +1749,27 @@ class MainActivity : CameraActivity() {
      * you write a value and read it back. This does exactly that, then restores
      * whatever was there, so one launch says whether the loop can work at all.
      */
-    private fun probeExposureControls() {
+    private fun probeExposureControls(phase: String) {
         val camera = getCurrentCamera() as? CameraUVC ?: run {
-            writeLog("exposure probe: no CameraUVC available")
+            writeLog("exposure probe [$phase]: no CameraUVC available")
             return
         }
         try {
             val startBrightness = camera.getBrightness()
             val startContrast = camera.getContrast()
-            writeLog("exposure probe: initial brightness=$startBrightness contrast=$startContrast")
+            writeLog(
+                "exposure probe [$phase]: initial brightness=$startBrightness contrast=$startContrast"
+            )
 
+            // The percent<->absolute round trip truncates twice, so a working
+            // control legitimately reads back a unit or two low. Only a wide miss
+            // means the write was rejected.
             for (probe in intArrayOf(20, 80)) {
                 camera.setBrightness(probe)
                 val got = camera.getBrightness()
                 writeLog(
-                    "exposure probe: brightness set=$probe read=$got " +
-                        if (got == probe) "OK" else "MISMATCH (control likely unsupported)"
+                    "exposure probe [$phase]: brightness set=$probe read=$got " +
+                        verdict(probe, got)
                 )
             }
             camera.setBrightness(startBrightness ?: BRIGHTNESS_DEFAULT)
@@ -1746,15 +1778,22 @@ class MainActivity : CameraActivity() {
                 camera.setContrast(probe)
                 val got = camera.getContrast()
                 writeLog(
-                    "exposure probe: contrast set=$probe read=$got " +
-                        if (got == probe) "OK" else "MISMATCH (control likely unsupported)"
+                    "exposure probe [$phase]: contrast set=$probe read=$got " + verdict(probe, got)
                 )
             }
             camera.setContrast(startContrast ?: BRIGHTNESS_DEFAULT)
-            writeLog("exposure probe: restored brightness=$startBrightness contrast=$startContrast")
+            writeLog(
+                "exposure probe [$phase]: restored brightness=$startBrightness contrast=$startContrast"
+            )
         } catch (e: Exception) {
-            writeLog("exposure probe: EXCEPTION - ${e.message}")
+            writeLog("exposure probe [$phase]: EXCEPTION - ${e.message}")
         }
+    }
+
+    private fun verdict(wanted: Int, got: Int?): String = when {
+        got == null -> "NULL (control unavailable)"
+        abs(got - wanted) <= CONTROL_READBACK_TOLERANCE -> "OK"
+        else -> "REVERTED (wrote $wanted, device holds $got)"
     }
 
     private fun resetExposure() {
