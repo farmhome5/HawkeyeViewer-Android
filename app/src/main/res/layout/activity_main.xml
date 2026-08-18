@@ -96,6 +96,31 @@
         android:layout_marginStart="12dp"
         android:layout_marginBottom="12dp" />
 
+    <!-- Mirror Tube Mode ON indicator. Sibling of cameraContainer, not a child:
+         the container is clipped to the mask outline, which would clip this away.
+         Deliberately small so it stays inside the black corner wedge even at the
+         maximum mask radius. Mirrors the Windows viewer's indicator. -->
+    <TextView
+        android:id="@+id/mtmIndicator"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Mirror Tube Mode\nON"
+        android:textColor="#E74C3C"
+        android:textSize="10sp"
+        android:textStyle="normal"
+        android:gravity="center"
+        android:lineSpacingMultiplier="1.1"
+        android:shadowColor="#E6000000"
+        android:shadowDx="0"
+        android:shadowDy="0"
+        android:shadowRadius="2"
+        android:visibility="gone"
+        android:elevation="12dp"
+        app:layout_constraintTop_toTopOf="@id/cameraContainer"
+        app:layout_constraintStart_toStartOf="@id/cameraContainer"
+        android:layout_marginStart="8dp"
+        android:layout_marginTop="6dp" />
+
     <!-- Compact Adjust Strip - phone only, positioned above bottom bar -->
     <LinearLayout
         android:id="@+id/adjustStrip"

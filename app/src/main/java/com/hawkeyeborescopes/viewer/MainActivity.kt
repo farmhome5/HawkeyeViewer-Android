@@ -1173,6 +1173,22 @@ class MainActivity : CameraActivity() {
         binding.gammaValue.text = "50"
         binding.sharpnessValue.text = "50"
 
+        // The dialog promises to reset transforms too. Only the phone was doing
+        // that, and then only as a side effect of the strip checkboxes syncing
+        // back to the panel — on a tablet mirror/flip survived the reset. Clear
+        // them here so both layouts honour what the dialog says.
+        binding.mirrorCheckBox.isChecked = false
+        binding.flipCheckBox.isChecked = false
+
+        // Clear Mirror Tube Mode along with them. Done directly rather than via
+        // setMirrorTubeMode() so it cannot re-toggle the mirror just cleared above;
+        // this also drops the mode's stale claim on the mirror.
+        maskOn = false
+        mtmAutoEnabledMirror = false
+        applyMask()
+        syncMaskUi()
+        saveMaskSettings()
+
         // Save defaults
         saveImageControls()
 
@@ -1269,6 +1285,7 @@ class MainActivity : CameraActivity() {
      */
     private fun applyMask() {
         val container = binding.cameraContainer
+        binding.mtmIndicator.visibility = if (maskOn) View.VISIBLE else View.GONE
         if (!maskOn) {
             container.clipToOutline = false
             container.outlineProvider = ViewOutlineProvider.BACKGROUND
