@@ -50,6 +50,8 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.min
 
 class MainActivity : CameraActivity() {
 
@@ -99,6 +101,29 @@ class MainActivity : CameraActivity() {
     private var currentStripSection = StripSection.IMAGE
     private var currentImageControlIndex = 0
 
+    // Auto image adjust: meter a region of the preview and drive one of the
+    // existing shader knobs toward a target mean luminance.
+    //
+    // This drives the shader, not the camera, because this camera reverts UVC
+    // control writes while streaming (proved on device: writes land before the
+    // stream starts, are silently reverted during). The shader is the only
+    // actuator that responds live. It lifts a dark view well, but it cannot
+    // recover highlights already clipped to white — that stays an optical fix.
+    //
+    // Frames arrive on the GL thread, the UI reads these — hence @Volatile.
+    @Volatile private var meterMode = METER_OFF
+    @Volatile private var meterX = 0.5f
+    @Volatile private var meterY = 0.5f
+    @Volatile private var targetLuma = TARGET_LUMA_DEFAULT
+    @Volatile private var adjustKnob = KNOB_BRIGHTNESS
+    @Volatile private var meterBusy = false
+    private var meterFrameCounter = 0
+    private var lastMeterLogMs = 0L
+    private var meterRailedCount = 0
+
+    // Guards the two UI copies (panel + strip) against listener feedback loops.
+    private var autoUiSyncing = false
+
     private val previewDataCallback = object : IPreviewDataCallBack {
         override fun onPreviewData(data: ByteArray?, width: Int, height: Int, format: IPreviewDataCallBack.DataFormat) {
             if (data == null) {
@@ -113,6 +138,8 @@ class MainActivity : CameraActivity() {
             latestPreviewHeight = height
             latestPreviewFormatName = format.name
             latestPreviewTimestampMs = System.currentTimeMillis()
+
+            meterFrame(data, width, height, format)
         }
     }
 
@@ -132,6 +159,46 @@ class MainActivity : CameraActivity() {
         private const val MAX_PREVIEW_FRAME_AGE_MS = 1_000L
         private const val CAPTURE_FEEDBACK_DURATION_MS = 350L
         private const val MAX_VISIBLE_HARDWARE_CAPTURE_AGE_MS = 2_000L
+
+        // --- Auto image adjust ---
+        private const val METER_OFF = "off"
+        private const val METER_SPOT = "spot"
+        private const val METER_CENTER = "center"
+        private const val METER_EDGE = "edge"
+        private val METER_MODES = listOf(METER_OFF, METER_SPOT, METER_CENTER, METER_EDGE)
+        private val METER_LABELS =
+            listOf("Off", "Spot (tap preview)", "Center disc", "Edge annulus")
+
+        private const val KNOB_BRIGHTNESS = "brightness"
+        private const val KNOB_CONTRAST = "contrast"
+        private const val KNOB_GAMMA = "gamma"
+        private val ADJUST_KNOBS = listOf(KNOB_BRIGHTNESS, KNOB_GAMMA, KNOB_CONTRAST)
+        private val ADJUST_KNOB_LABELS = listOf("Brightness", "Gamma", "Contrast")
+
+        private const val TARGET_LUMA_MIN = 60
+        private const val TARGET_LUMA_MAX = 200
+        private const val TARGET_LUMA_DEFAULT = 125
+        private const val LUMA_DEADBAND = 8          // no correction inside target +/- this
+        private const val METER_EVERY_N_FRAMES = 5   // control step every N frames
+        private const val METER_MAX_STEP = 6         // max slider units per step
+        private const val LUMA_SUBSAMPLE = 4         // sample every Nth pixel per axis
+        private const val METER_LOG_INTERVAL_MS = 500L
+        private const val METER_RAILED_ALERT_AFTER = 12
+        private const val SLIDER_MIN = 0
+        private const val SLIDER_MAX = 100
+        private const val SLIDER_NEUTRAL = 50
+        private const val MID_GREY = 128            // contrast pivots around 0.5
+
+        // Edge annulus, as fractions of the shorter side. Self-contained so this
+        // branch does not depend on the mask feature.
+        private const val EDGE_OUTER_FRACTION = 0.49f
+        private const val EDGE_INNER_RATIO = 0.70f
+        private const val CENTER_DISC_FRACTION = 0.30f
+        private const val SPOT_WINDOW_FRACTION = 0.12f
+
+        // The RGBA preview buffer comes from glReadPixels, whose origin is
+        // bottom-left, so buffer row 0 is the bottom of the displayed image.
+        private const val RGBA_BUFFER_Y_FLIPPED = true
     }
 
     private fun writeLog(message: String) {
@@ -433,6 +500,7 @@ class MainActivity : CameraActivity() {
         setupCameraControls()
         setupImageControls()
         setupTransformControls()
+        setupAutoAdjustControls()
         setupCollapsibleSections()
         setupZoomPan()
 
@@ -521,6 +589,18 @@ class MainActivity : CameraActivity() {
             object : GestureDetector.SimpleOnGestureListener() {
                 override fun onDoubleTap(e: MotionEvent): Boolean {
                     resetZoomPan()
+                    return true
+                }
+
+                // Single tap meters the tapped spot. onSingleTapConfirmed only
+                // fires once the double-tap window has elapsed, so it never
+                // competes with double-tap-to-reset above.
+                override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                    val w = binding.cameraContainer.width.toFloat()
+                    val h = binding.cameraContainer.height.toFloat()
+                    if (w <= 0f || h <= 0f) return false
+                    if (!isCameraOpened()) return false
+                    meterAt(e.x / w, e.y / h)
                     return true
                 }
             })
@@ -1178,6 +1258,372 @@ class MainActivity : CameraActivity() {
         }
         writeLog("Setting transform: $rotateType (mirror=$mirror, flip=$flip)")
         setRotateType(rotateType)
+    }
+
+    // ==================== Auto image adjust (luminance metering) ====================
+
+    /**
+     * Wires the auto-adjust controls. These exist twice: in the tablet settings
+     * panel and in the phone adjust strip (the phone's Settings button opens the
+     * strip, not the panel, so the strip copy is the one that matters on a
+     * handset). Both drive the same state, and syncAutoUi pushes it back to both.
+     */
+    private fun setupAutoAdjustControls() {
+        val meterAdapter = {
+            ArrayAdapter(this, R.layout.spinner_item, METER_LABELS)
+                .also { it.setDropDownViewResource(R.layout.spinner_dropdown_item) }
+        }
+        val meterListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (autoUiSyncing || position !in METER_MODES.indices) return
+                setMeterMode(METER_MODES[position])
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        binding.meterModeSpinner.adapter = meterAdapter()
+        binding.meterModeSpinner.onItemSelectedListener = meterListener
+        binding.stripMeterSpinner?.adapter = meterAdapter()
+        binding.stripMeterSpinner?.onItemSelectedListener = meterListener
+
+        val knobAdapter = {
+            ArrayAdapter(this, R.layout.spinner_item, ADJUST_KNOB_LABELS)
+                .also { it.setDropDownViewResource(R.layout.spinner_dropdown_item) }
+        }
+        val knobListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (autoUiSyncing || position !in ADJUST_KNOBS.indices) return
+                adjustKnob = ADJUST_KNOBS[position]
+                meterRailedCount = 0
+                writeLog("Auto adjust knob -> $adjustKnob")
+                syncAutoUi()
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        binding.adjustKnobSpinner.adapter = knobAdapter()
+        binding.adjustKnobSpinner.onItemSelectedListener = knobListener
+        binding.stripKnobSpinner?.adapter = knobAdapter()
+        binding.stripKnobSpinner?.onItemSelectedListener = knobListener
+
+        // Target luma: bar runs 0..140, offset by TARGET_LUMA_MIN.
+        binding.targetLumaSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (!fromUser || autoUiSyncing) return
+                targetLuma = (progress + TARGET_LUMA_MIN).coerceIn(TARGET_LUMA_MIN, TARGET_LUMA_MAX)
+                binding.targetLumaValue.text = targetLuma.toString()
+                meterRailedCount = 0
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
+
+        binding.resetAutoAdjustButton.setOnClickListener { resetAutoAdjust() }
+        binding.stripResetAutoButton?.setOnClickListener { resetAutoAdjust() }
+
+        syncAutoUi()
+    }
+
+    private fun setMeterMode(mode: String) {
+        meterMode = mode
+        meterFrameCounter = 0
+        meterRailedCount = 0
+        syncAutoUi()
+        writeLog("Metering mode -> $mode (target=$targetLuma knob=$adjustKnob)")
+        if (mode == METER_OFF) {
+            updateMeterStatus("Auto adjust off — tap the preview to meter a spot")
+        }
+    }
+
+    /** Pushes auto-adjust state into both UI copies without re-entering listeners. */
+    private fun syncAutoUi() {
+        autoUiSyncing = true
+        try {
+            val modeIndex = METER_MODES.indexOf(meterMode).coerceAtLeast(0)
+            if (binding.meterModeSpinner.selectedItemPosition != modeIndex) {
+                binding.meterModeSpinner.setSelection(modeIndex)
+            }
+            binding.stripMeterSpinner?.let {
+                if (it.selectedItemPosition != modeIndex) it.setSelection(modeIndex)
+            }
+
+            val knobIndex = ADJUST_KNOBS.indexOf(adjustKnob).coerceAtLeast(0)
+            if (binding.adjustKnobSpinner.selectedItemPosition != knobIndex) {
+                binding.adjustKnobSpinner.setSelection(knobIndex)
+            }
+            binding.stripKnobSpinner?.let {
+                if (it.selectedItemPosition != knobIndex) it.setSelection(knobIndex)
+            }
+
+            binding.targetLumaSeekBar.progress = targetLuma - TARGET_LUMA_MIN
+            binding.targetLumaValue.text = targetLuma.toString()
+        } finally {
+            autoUiSyncing = false
+        }
+    }
+
+    /**
+     * Point spot metering at a tap.
+     *
+     * (fx, fy) are fractions of the preview container. The RGBA preview buffer we
+     * meter is the output of the capture render pass, which already has zoom, pan,
+     * crop and mirror/flip applied — it is framed exactly like what is on screen.
+     * So the tap fraction maps straight through with no inverse transform, and the
+     * only correction needed is the glReadPixels bottom-up row order.
+     */
+    private fun meterAt(fx: Float, fy: Float) {
+        meterX = fx.coerceIn(0f, 1f)
+        meterY = fy.coerceIn(0f, 1f)
+        meterMode = METER_SPOT
+        meterFrameCounter = 0
+        meterRailedCount = 0
+        syncAutoUi()
+        writeLog("meterAt x=%.3f y=%.3f knob=%s".format(meterX, meterY, adjustKnob))
+        showMeterReticle(fx, fy)
+    }
+
+    /** Brief visual confirmation of where metering was pointed. */
+    private fun showMeterReticle(fx: Float, fy: Float) {
+        if (binding.cameraContainer.width <= 0) return
+        binding.zoomOverlay.text = "meter %d%%,%d%%".format((fx * 100).toInt(), (fy * 100).toInt())
+        binding.zoomOverlay.visibility = View.VISIBLE
+        zoomOverlayHandler.removeCallbacksAndMessages(null)
+        zoomOverlayHandler.postDelayed({
+            binding.zoomOverlay.visibility = View.GONE
+        }, ZOOM_OVERLAY_FADE_MS)
+    }
+
+    /**
+     * One metering pass over a preview frame. Called on the render thread for
+     * every frame, so it throttles hard and bails cheaply when metering is off.
+     */
+    private fun meterFrame(
+        data: ByteArray,
+        width: Int,
+        height: Int,
+        format: IPreviewDataCallBack.DataFormat
+    ) {
+        if (meterMode == METER_OFF) return
+        if (width <= 0 || height <= 0) return
+        if (++meterFrameCounter % METER_EVERY_N_FRAMES != 0) return
+        if (meterBusy) return
+        meterBusy = true
+        try {
+            val mean = when (format) {
+                IPreviewDataCallBack.DataFormat.RGBA -> meanLumaRgba(data, width, height)
+                IPreviewDataCallBack.DataFormat.NV21 -> meanLumaNv21(data, width, height)
+                else -> -1
+            }
+            if (mean >= 0) runOnUiThread { stepAdjustment(mean) }
+        } catch (e: Exception) {
+            writeLog("meterFrame: EXCEPTION - ${e.message}")
+        } finally {
+            meterBusy = false
+        }
+    }
+
+    /**
+     * Mean luminance over the active metering region of an RGBA buffer,
+     * using Rec.601 weights on subsampled pixels.
+     */
+    private fun meanLumaRgba(data: ByteArray, width: Int, height: Int): Int {
+        if (data.size < width * height * 4) return -1
+        var sum = 0L
+        var count = 0
+        forEachRegionPixel(width, height, LUMA_SUBSAMPLE) { x, y ->
+            // glReadPixels row 0 is the bottom of the image.
+            val row = if (RGBA_BUFFER_Y_FLIPPED) height - 1 - y else y
+            val i = (row * width + x) * 4
+            val r = data[i].toInt() and 0xFF
+            val g = data[i + 1].toInt() and 0xFF
+            val b = data[i + 2].toInt() and 0xFF
+            sum += (r * 299 + g * 587 + b * 114) / 1000
+            count++
+        }
+        return if (count > 0) (sum / count).toInt() else -1
+    }
+
+    /** Mean luminance from an NV21 buffer; the Y plane is the first w*h bytes. */
+    private fun meanLumaNv21(data: ByteArray, width: Int, height: Int): Int {
+        if (data.size < width * height) return -1
+        var sum = 0L
+        var count = 0
+        forEachRegionPixel(width, height, LUMA_SUBSAMPLE) { x, y ->
+            sum += (data[y * width + x].toInt() and 0xFF)
+            count++
+        }
+        return if (count > 0) (sum / count).toInt() else -1
+    }
+
+    /**
+     * Walks the pixels of the active metering region, in display orientation
+     * (y = 0 is the top of the image as seen on screen).
+     */
+    private inline fun forEachRegionPixel(
+        width: Int,
+        height: Int,
+        step: Int,
+        body: (x: Int, y: Int) -> Unit
+    ) {
+        val shorter = min(width, height)
+        val cx = width / 2
+        val cy = height / 2
+        when (meterMode) {
+            METER_SPOT -> {
+                val sx = (meterX * width).toInt()
+                val sy = (meterY * height).toInt()
+                val r = (SPOT_WINDOW_FRACTION * shorter).toInt().coerceAtLeast(1)
+                var y = (sy - r).coerceAtLeast(0)
+                val yEnd = (sy + r).coerceAtMost(height)
+                while (y < yEnd) {
+                    var x = (sx - r).coerceAtLeast(0)
+                    val xEnd = (sx + r).coerceAtMost(width)
+                    while (x < xEnd) { body(x, y); x += step }
+                    y += step
+                }
+            }
+            METER_CENTER -> {
+                val r = (CENTER_DISC_FRACTION * shorter).toInt()
+                val r2 = r.toLong() * r
+                var y = (cy - r).coerceAtLeast(0)
+                val yEnd = (cy + r).coerceAtMost(height)
+                while (y < yEnd) {
+                    var x = (cx - r).coerceAtLeast(0)
+                    val xEnd = (cx + r).coerceAtMost(width)
+                    while (x < xEnd) {
+                        val dx = (x - cx).toLong()
+                        val dy = (y - cy).toLong()
+                        if (dx * dx + dy * dy <= r2) body(x, y)
+                        x += step
+                    }
+                    y += step
+                }
+            }
+            METER_EDGE -> {
+                // Annulus near the rim — the mirror-tube case, where the glare
+                // sits on the tube's ring rather than in the middle.
+                val rOut = (EDGE_OUTER_FRACTION * shorter).toInt().coerceAtLeast(2)
+                val rIn = (EDGE_INNER_RATIO * rOut).toInt()
+                val rOut2 = rOut.toLong() * rOut
+                val rIn2 = rIn.toLong() * rIn
+                var y = (cy - rOut).coerceAtLeast(0)
+                val yEnd = (cy + rOut).coerceAtMost(height)
+                while (y < yEnd) {
+                    var x = (cx - rOut).coerceAtLeast(0)
+                    val xEnd = (cx + rOut).coerceAtMost(width)
+                    while (x < xEnd) {
+                        val dx = (x - cx).toLong()
+                        val dy = (y - cy).toLong()
+                        val d2 = dx * dx + dy * dy
+                        if (d2 in rIn2..rOut2) body(x, y)
+                        x += step
+                    }
+                    y += step
+                }
+            }
+        }
+    }
+
+    /**
+     * One proportional control step on the selected shader knob.
+     *
+     * This is a true closed loop: the RGBA frames we meter are the shader's own
+     * output, so each correction shows up in the next measurement and the loop
+     * converges. Must run on the UI thread — it moves the seek bars.
+     *
+     * Direction is per-knob, and contrast is the awkward one. Brightness
+     * (color *= b) and gamma (pow(color, 1/g)) both rise monotonically with the
+     * slider, but contrast scales around 0.5 grey: on a dark region, raising
+     * contrast makes it darker still. A fixed-sign loop on contrast runs away.
+     */
+    private fun stepAdjustment(meanLuma: Int) {
+        val error = targetLuma - meanLuma          // positive means too dark
+        if (abs(error) <= LUMA_DEADBAND) {
+            meterRailedCount = 0
+            postMeterStatus(meanLuma, currentKnobValue(), settled = true)
+            return
+        }
+
+        // Does raising this knob's slider raise the measured luminance?
+        val direction = when (adjustKnob) {
+            KNOB_CONTRAST -> if (meanLuma >= MID_GREY) 1 else -1
+            else -> 1
+        }
+
+        val current = currentKnobValue()
+        var delta = (error / 4).coerceIn(-METER_MAX_STEP, METER_MAX_STEP)
+        if (delta == 0) delta = if (error > 0) 1 else -1
+        val next = (current + delta * direction).coerceIn(SLIDER_MIN, SLIDER_MAX)
+
+        if (next == current) {
+            meterRailedCount++
+            if (meterRailedCount >= METER_RAILED_ALERT_AFTER) {
+                logMeterThrottled(
+                    "stepAdjustment: $adjustKnob railed at $current, luma=$meanLuma " +
+                        "target=$targetLuma err=$error — cannot reach target with this knob"
+                )
+                updateMeterStatus(
+                    "luma $meanLuma · $adjustKnob at limit ($current) · try Gamma"
+                )
+                return
+            }
+            postMeterStatus(meanLuma, current, settled = false)
+            return
+        }
+        meterRailedCount = 0
+
+        applyKnobValue(next)
+        logMeterThrottled(
+            "stepAdjustment: luma=$meanLuma err=$error $adjustKnob $current -> $next"
+        )
+        postMeterStatus(meanLuma, next, settled = false)
+    }
+
+    private fun knobSeekBar(): SeekBar = when (adjustKnob) {
+        KNOB_CONTRAST -> binding.contrastSeekBar
+        KNOB_GAMMA -> binding.gammaSeekBar
+        else -> binding.brightnessSeekBar
+    }
+
+    private fun currentKnobValue(): Int = knobSeekBar().progress
+
+    /**
+     * Moves the knob. Sets the seek bar so the change is visible and manual and
+     * automatic control cannot disagree, then applies the shader value —
+     * the bar's own listener ignores non-user changes, so this does not recurse.
+     */
+    private fun applyKnobValue(value: Int) {
+        knobSeekBar().progress = value
+        applyShaderAdjustment(adjustKnob, value)
+    }
+
+    private fun resetAutoAdjust() {
+        meterMode = METER_OFF
+        meterRailedCount = 0
+        syncAutoUi()
+        // Put the driven knob back to neutral so the preview returns to normal.
+        applyKnobValue(SLIDER_NEUTRAL)
+        saveImageControls()
+        writeLog("resetAutoAdjust: $adjustKnob -> $SLIDER_NEUTRAL, metering off")
+        updateMeterStatus("Auto adjust off — $adjustKnob reset to $SLIDER_NEUTRAL")
+    }
+
+    /** Rate-limits metering diagnostics so the loop cannot flood the log file. */
+    private fun logMeterThrottled(message: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastMeterLogMs < METER_LOG_INTERVAL_MS) return
+        lastMeterLogMs = now
+        writeLog(message)
+    }
+
+    private fun postMeterStatus(meanLuma: Int, knobValue: Int, settled: Boolean) {
+        updateMeterStatus(
+            "luma $meanLuma / target $targetLuma · $adjustKnob $knobValue · " +
+                (if (settled) "settled" else "adjusting") + " · $meterMode"
+        )
+    }
+
+    private fun updateMeterStatus(text: String) {
+        binding.meterStatusText.text = text
+        binding.stripMeterStatusText?.text = text
     }
 
     private fun setupCollapsibleSections() {
@@ -2005,6 +2451,9 @@ private fun showStillCapturedFeedback() {
         controlRow?.visibility = if (section == StripSection.IMAGE) View.VISIBLE else View.GONE
         cameraContent?.visibility = if (section == StripSection.CAMERA) View.VISIBLE else View.GONE
         transformContent?.visibility = if (section == StripSection.TRANSFORM) View.VISIBLE else View.GONE
+        // Auto-adjust controls ride along with the CAM tab
+        binding.stripAutoContent?.visibility =
+            if (section == StripSection.CAMERA) View.VISIBLE else View.GONE
 
         if (section == StripSection.IMAGE) {
             updateStripImageControl()
