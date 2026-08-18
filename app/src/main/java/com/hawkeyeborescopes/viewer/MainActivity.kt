@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
+import android.graphics.Outline
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.hardware.usb.UsbDevice
@@ -18,6 +19,7 @@ import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
 import android.widget.ImageView
 import android.widget.SeekBar
 import android.widget.Toast
@@ -50,6 +52,8 @@ import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.min
 
 class MainActivity : CameraActivity() {
 
@@ -99,6 +103,32 @@ class MainActivity : CameraActivity() {
     private var currentStripSection = StripSection.IMAGE
     private var currentImageControlIndex = 0
 
+    // Scope mode: circular mask over the preview, for mirror-tube use.
+    // maskRadiusRef is in px of a 720-tall reference frame, same units as the
+    // Windows viewer's Mask Radius slider (100..360, 360 = inscribed circle).
+    private var maskOn = false
+    private var maskRadiusRef = MASK_RADIUS_DEFAULT
+
+    // Touch / weighted luminance metering.
+    // Frames arrive on the GL thread, the UI reads these — hence @Volatile.
+    @Volatile private var meterMode = METER_OFF
+    @Volatile private var meterX = 0.5f
+    @Volatile private var meterY = 0.5f
+    @Volatile private var meterWindow = 0.12f
+    @Volatile private var targetLuma = 125
+    @Volatile private var meterBusy = false
+    private var meterFrameCounter = 0
+
+    // Set on each spot tap: logs the sampled luma for both row orders once, so a
+    // single tap on a known-bright area confirms RGBA_BUFFER_Y_FLIPPED on device.
+    @Volatile private var meterDiagPending = false
+
+    // Guards the two UI copies (panel + strip) against listener feedback loops.
+    private var scopeUiSyncing = false
+
+    // One-shot: raw-frame spot metering misalignment warning, reset on each tap.
+    @Volatile private var rawSpotWarningIssued = false
+
     private val previewDataCallback = object : IPreviewDataCallBack {
         override fun onPreviewData(data: ByteArray?, width: Int, height: Int, format: IPreviewDataCallBack.DataFormat) {
             if (data == null) {
@@ -113,6 +143,8 @@ class MainActivity : CameraActivity() {
             latestPreviewHeight = height
             latestPreviewFormatName = format.name
             latestPreviewTimestampMs = System.currentTimeMillis()
+
+            meterFrame(data, width, height, format)
         }
     }
 
@@ -132,6 +164,37 @@ class MainActivity : CameraActivity() {
         private const val MAX_PREVIEW_FRAME_AGE_MS = 1_000L
         private const val CAPTURE_FEEDBACK_DURATION_MS = 350L
         private const val MAX_VISIBLE_HARDWARE_CAPTURE_AGE_MS = 2_000L
+
+        // --- Scope mask ---
+        // Radius is expressed in px of a 720-tall reference frame so the numbers
+        // match the Windows viewer's Mask Radius slider one-for-one.
+        private const val MASK_REF_HEIGHT = 720f
+        private const val MASK_RADIUS_MIN = 100
+        private const val MASK_RADIUS_MAX = 360
+        private const val MASK_RADIUS_DEFAULT = 280
+
+        // --- Luminance metering ---
+        private const val METER_OFF = "off"
+        private const val METER_SPOT = "spot"
+        private const val METER_CENTER = "center"
+        private const val METER_EDGE = "edge"
+        private val METER_MODES = listOf(METER_OFF, METER_SPOT, METER_CENTER, METER_EDGE)
+        private val METER_LABELS = listOf("Off", "Spot (tap preview)", "Center disc", "Edge annulus")
+        private const val LUMA_DEADBAND = 8          // no correction inside target +/- this
+        private const val METER_EVERY_N_FRAMES = 5   // control step every N frames
+        private const val METER_MAX_STEP = 6         // max brightness units per step
+        private const val LUMA_SUBSAMPLE = 4         // sample every Nth pixel per axis
+        private const val BRIGHTNESS_MIN = 0
+        private const val BRIGHTNESS_MAX = 100
+        private const val BRIGHTNESS_DEFAULT = 50
+
+        // The RGBA preview buffer comes from glReadPixels, whose origin is
+        // bottom-left, so buffer row 0 is the bottom of the displayed image.
+        private const val RGBA_BUFFER_Y_FLIPPED = true
+
+        private const val PREFS_NAME = "image_adjustments"
+        private const val PREF_MASK_ON = "scope_mask_on"
+        private const val PREF_MASK_RADIUS = "scope_mask_radius"
     }
 
     private fun writeLog(message: String) {
@@ -387,6 +450,8 @@ class MainActivity : CameraActivity() {
                 applyAspectType(aspectRatioTypes[pos])
             }
         }
+        // Keep the scope circle correct across rotation
+        applyMask()
     }
 
     override fun onStart() {
@@ -433,6 +498,7 @@ class MainActivity : CameraActivity() {
         setupCameraControls()
         setupImageControls()
         setupTransformControls()
+        setupScopeControls()
         setupCollapsibleSections()
         setupZoomPan()
 
@@ -521,6 +587,18 @@ class MainActivity : CameraActivity() {
             object : GestureDetector.SimpleOnGestureListener() {
                 override fun onDoubleTap(e: MotionEvent): Boolean {
                     resetZoomPan()
+                    return true
+                }
+
+                // Single tap meters the tapped spot. onSingleTapConfirmed only
+                // fires once the double-tap window has elapsed, so it never
+                // competes with double-tap-to-reset above.
+                override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                    val w = binding.cameraContainer.width.toFloat()
+                    val h = binding.cameraContainer.height.toFloat()
+                    if (w <= 0f || h <= 0f) return false
+                    if (!isCameraOpened()) return false
+                    meterAt(e.x / w, e.y / h)
                     return true
                 }
             })
@@ -1178,6 +1256,449 @@ class MainActivity : CameraActivity() {
         }
         writeLog("Setting transform: $rotateType (mirror=$mirror, flip=$flip)")
         setRotateType(rotateType)
+    }
+
+    // ==================== Scope mask + luminance metering ====================
+
+    /**
+     * Wires the scope + metering controls. These exist twice: in the tablet
+     * settings panel and in the phone adjust strip (the phone's Settings button
+     * opens the strip, not the panel, so the strip copy is the one that matters
+     * on a handset). Both drive the same state through the set* helpers below,
+     * and syncScopeUi pushes state back to whichever views are present.
+     */
+    private fun setupScopeControls() {
+        restoreScopeSettings()
+
+        // --- Scope mode toggle ---
+        val scopeToggle = { _: android.widget.CompoundButton, checked: Boolean ->
+            if (!scopeUiSyncing) setScopeMask(checked)
+        }
+        binding.scopeModeCheckBox.setOnCheckedChangeListener(scopeToggle)
+        binding.stripScopeCheckBox?.setOnCheckedChangeListener(scopeToggle)
+
+        // --- Mask radius. SeekBar has no android:min below API 26, so the bar is
+        // 0..260 and MASK_RADIUS_MIN is added to get the 100..360 slider value. ---
+        val radiusListener = object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (!fromUser || scopeUiSyncing) return
+                setMaskRadius(progress + MASK_RADIUS_MIN)
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) { saveScopeSettings() }
+        }
+        binding.maskRadiusSeekBar.setOnSeekBarChangeListener(radiusListener)
+        binding.stripMaskRadiusSeekBar?.setOnSeekBarChangeListener(radiusListener)
+
+        // --- Metering mode ---
+        val meterAdapter = {
+            ArrayAdapter(this, R.layout.spinner_item, METER_LABELS)
+                .also { it.setDropDownViewResource(R.layout.spinner_dropdown_item) }
+        }
+        val meterListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (scopeUiSyncing || position !in METER_MODES.indices) return
+                setMeterMode(METER_MODES[position])
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        binding.meterModeSpinner.adapter = meterAdapter()
+        binding.meterModeSpinner.onItemSelectedListener = meterListener
+        binding.stripMeterSpinner?.adapter = meterAdapter()
+        binding.stripMeterSpinner?.onItemSelectedListener = meterListener
+
+        // --- Reset exposure ---
+        binding.resetExposureButton.setOnClickListener { resetExposure() }
+        binding.stripResetExposureButton?.setOnClickListener { resetExposure() }
+
+        // The container is resized by aspect-ratio changes as well as rotation;
+        // re-query the outline whenever its bounds move so the circle follows.
+        binding.cameraContainer.addOnLayoutChangeListener { _, l, t, r, b, ol, ot, or, ob ->
+            if (maskOn && (r - l != or - ol || b - t != ob - ot)) {
+                binding.cameraContainer.invalidateOutline()
+            }
+        }
+
+        syncScopeUi()
+        applyMask()
+    }
+
+    private fun setScopeMask(on: Boolean) {
+        maskOn = on
+        applyMask()
+        syncScopeUi()
+        saveScopeSettings()
+        writeLog("Scope mode ${if (on) "on" else "off"} (radius=$maskRadiusRef)")
+    }
+
+    private fun setMaskRadius(value: Int) {
+        maskRadiusRef = value.coerceIn(MASK_RADIUS_MIN, MASK_RADIUS_MAX)
+        applyMask()
+        syncScopeUi()
+    }
+
+    private fun setMeterMode(mode: String) {
+        meterMode = mode
+        meterFrameCounter = 0
+        syncScopeUi()
+        writeLog("Metering mode -> $mode (target=$targetLuma)")
+        if (mode == METER_OFF) {
+            updateMeterStatus("Metering off — tap the preview to meter a spot")
+        }
+    }
+
+    /** Pushes current scope/metering state into both UI copies without re-entering listeners. */
+    private fun syncScopeUi() {
+        scopeUiSyncing = true
+        try {
+            binding.scopeModeCheckBox.isChecked = maskOn
+            binding.stripScopeCheckBox?.isChecked = maskOn
+
+            val progress = maskRadiusRef - MASK_RADIUS_MIN
+            binding.maskRadiusSeekBar.progress = progress
+            binding.stripMaskRadiusSeekBar?.progress = progress
+            binding.maskRadiusValue.text = maskRadiusRef.toString()
+            binding.stripMaskRadiusValue?.text = maskRadiusRef.toString()
+
+            val index = METER_MODES.indexOf(meterMode).coerceAtLeast(0)
+            if (binding.meterModeSpinner.selectedItemPosition != index) {
+                binding.meterModeSpinner.setSelection(index)
+            }
+            binding.stripMeterSpinner?.let {
+                if (it.selectedItemPosition != index) it.setSelection(index)
+            }
+        } finally {
+            scopeUiSyncing = false
+        }
+    }
+
+    /**
+     * Applies (or clears) the circular clip on the preview container.
+     *
+     * Clipping the container rather than the TextureView is deliberate: zoom,
+     * pan, crop and mirror/flip are all GL-side in this app (see base_vertex.glsl),
+     * so the container is never itself transformed. The circle therefore stays
+     * put while the image zooms and pans underneath it, like a real scope.
+     * UI thread only.
+     */
+    private fun applyMask() {
+        val container = binding.cameraContainer
+        if (!maskOn) {
+            container.clipToOutline = false
+            container.outlineProvider = ViewOutlineProvider.BACKGROUND
+            container.invalidateOutline()
+            return
+        }
+        container.outlineProvider = object : ViewOutlineProvider() {
+            override fun getOutline(view: View, outline: Outline) {
+                val w = view.width
+                val h = view.height
+                if (w <= 0 || h <= 0) {
+                    outline.setRect(0, 0, w, h)
+                    return
+                }
+                // Radius scales off the shorter side so the circle always fits.
+                val r = (min(w, h) * (maskRadiusRef / MASK_REF_HEIGHT)).toInt()
+                    .coerceIn(1, min(w, h) / 2)
+                val cx = w / 2
+                val cy = h / 2
+                outline.setOval(cx - r, cy - r, cx + r, cy + r)
+            }
+        }
+        container.clipToOutline = true
+        container.invalidateOutline()
+    }
+
+    private fun saveScopeSettings() {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+            .putBoolean(PREF_MASK_ON, maskOn)
+            .putInt(PREF_MASK_RADIUS, maskRadiusRef)
+            .apply()
+    }
+
+    private fun restoreScopeSettings() {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        maskOn = prefs.getBoolean(PREF_MASK_ON, false)
+        maskRadiusRef = prefs.getInt(PREF_MASK_RADIUS, MASK_RADIUS_DEFAULT)
+            .coerceIn(MASK_RADIUS_MIN, MASK_RADIUS_MAX)
+    }
+
+    /**
+     * Point spot metering at a tap.
+     *
+     * (fx, fy) are fractions of the preview container. The RGBA preview buffer we
+     * meter is the output of the capture render pass, which already has zoom, pan,
+     * crop and mirror/flip baked in — it is framed exactly like what is on screen.
+     * So the tap fraction maps straight through with no inverse transform, and the
+     * only correction needed is the glReadPixels bottom-up row order.
+     */
+    private fun meterAt(fx: Float, fy: Float) {
+        meterX = fx.coerceIn(0f, 1f)
+        meterY = fy.coerceIn(0f, 1f)
+        meterMode = METER_SPOT
+        meterFrameCounter = 0
+        meterDiagPending = true
+        rawSpotWarningIssued = false
+        // Keep both spinner copies in sync when metering is driven by a tap.
+        syncScopeUi()
+        writeLog("meterAt x=%.3f y=%.3f".format(meterX, meterY))
+        showMeterReticle(fx, fy)
+    }
+
+    /** Brief visual confirmation of where metering was pointed. */
+    private fun showMeterReticle(fx: Float, fy: Float) {
+        val container = binding.cameraContainer
+        if (container.width <= 0 || container.height <= 0) return
+        binding.zoomOverlay.text = "meter %d%%,%d%%".format((fx * 100).toInt(), (fy * 100).toInt())
+        binding.zoomOverlay.visibility = View.VISIBLE
+        zoomOverlayHandler.removeCallbacksAndMessages(null)
+        zoomOverlayHandler.postDelayed({
+            binding.zoomOverlay.visibility = View.GONE
+        }, ZOOM_OVERLAY_FADE_MS)
+    }
+
+    /**
+     * One metering pass over a preview frame. Called on the render thread for
+     * every frame, so it throttles hard and bails cheaply when metering is off.
+     */
+    private fun meterFrame(
+        data: ByteArray,
+        width: Int,
+        height: Int,
+        format: IPreviewDataCallBack.DataFormat
+    ) {
+        if (meterMode == METER_OFF) return
+        if (width <= 0 || height <= 0) return
+        if (++meterFrameCounter % METER_EVERY_N_FRAMES != 0) return
+        if (meterBusy) return
+        meterBusy = true
+        try {
+            if (meterDiagPending && format == IPreviewDataCallBack.DataFormat.RGBA) {
+                meterDiagPending = false
+                val asIs = meanLumaRgba(data, width, height, flipRows = false)
+                val flipped = meanLumaRgba(data, width, height, flipRows = true)
+                writeLog(
+                    "meter Y-order probe: buffer=${width}x$height  " +
+                        "rows-as-is=$asIs  rows-flipped=$flipped  " +
+                        "(using ${if (RGBA_BUFFER_Y_FLIPPED) "flipped" else "as-is"}; " +
+                        "tapped point should read as the brighter/darker one you aimed at)"
+                )
+            }
+            val mean = when (format) {
+                // RGBA comes out of the capture render pass, so it already has
+                // zoom, pan, crop and mirror/flip applied — it is framed exactly
+                // like the screen and the tap fraction maps straight through.
+                IPreviewDataCallBack.DataFormat.RGBA ->
+                    meanLumaRgba(data, width, height, RGBA_BUFFER_Y_FLIPPED)
+                // NV21 is the raw frame from libuvc, upstream of all GL transforms.
+                // Centre and edge regions are defined on the frame itself so they
+                // stay correct, but a tapped spot is only in the right place while
+                // zoom/pan/mirror are at their defaults. Flag it rather than
+                // silently metering the wrong patch.
+                IPreviewDataCallBack.DataFormat.NV21 -> {
+                    warnIfRawSpotMisaligned()
+                    meanLumaNv21(data, width, height)
+                }
+                else -> -1
+            }
+            if (mean >= 0) stepBrightness(mean)
+        } catch (e: Exception) {
+            writeLog("meterFrame: EXCEPTION - ${e.message}")
+        } finally {
+            meterBusy = false
+        }
+    }
+
+    /**
+     * Warns once per tap when spot metering a raw frame while a GL transform is
+     * active, since the tapped point and the raw frame no longer line up.
+     */
+    private fun warnIfRawSpotMisaligned() {
+        if (meterMode != METER_SPOT || rawSpotWarningIssued) return
+        val transformed = currentZoom > 1.001f ||
+            abs(currentPanX) > 0.001f ||
+            abs(currentPanY) > 0.001f ||
+            binding.mirrorCheckBox.isChecked ||
+            binding.flipCheckBox.isChecked
+        if (!transformed) return
+        rawSpotWarningIssued = true
+        writeLog(
+            "metering: spot on a raw NV21 frame with zoom/pan/mirror active — " +
+                "the tapped point is offset from the frame. Reset zoom/pan " +
+                "(double-tap the preview) or use centre/edge mode instead."
+        )
+    }
+
+    /**
+     * Mean luminance over the active metering region of an RGBA buffer.
+     * Uses Rec.601 luma weights on subsampled pixels.
+     */
+    private fun meanLumaRgba(
+        data: ByteArray,
+        width: Int,
+        height: Int,
+        flipRows: Boolean
+    ): Int {
+        if (data.size < width * height * 4) return -1
+        var sum = 0L
+        var count = 0
+        val step = LUMA_SUBSAMPLE
+
+        forEachRegionPixel(width, height, step) { x, y ->
+            // glReadPixels row 0 is the bottom of the image.
+            val row = if (flipRows) height - 1 - y else y
+            val i = (row * width + x) * 4
+            val r = data[i].toInt() and 0xFF
+            val g = data[i + 1].toInt() and 0xFF
+            val b = data[i + 2].toInt() and 0xFF
+            sum += (r * 299 + g * 587 + b * 114) / 1000
+            count++
+        }
+        return if (count > 0) (sum / count).toInt() else -1
+    }
+
+    /**
+     * Mean luminance over the active metering region of an NV21 buffer.
+     * The Y plane is the first width*height bytes. Kept for the raw-preview
+     * path (setRawPreviewData(true)), which this app does not currently use.
+     */
+    private fun meanLumaNv21(data: ByteArray, width: Int, height: Int): Int {
+        if (data.size < width * height) return -1
+        var sum = 0L
+        var count = 0
+        forEachRegionPixel(width, height, LUMA_SUBSAMPLE) { x, y ->
+            sum += (data[y * width + x].toInt() and 0xFF)
+            count++
+        }
+        return if (count > 0) (sum / count).toInt() else -1
+    }
+
+    /**
+     * Walks the pixels of the active metering region, in display orientation
+     * (y = 0 is the top of the image as seen on screen).
+     */
+    private inline fun forEachRegionPixel(
+        width: Int,
+        height: Int,
+        step: Int,
+        body: (x: Int, y: Int) -> Unit
+    ) {
+        val shorter = min(width, height)
+        when (meterMode) {
+            METER_SPOT -> {
+                val cx = (meterX * width).toInt()
+                val cy = (meterY * height).toInt()
+                val r = (meterWindow * shorter).toInt().coerceAtLeast(1)
+                val x0 = (cx - r).coerceAtLeast(0)
+                val x1 = (cx + r).coerceAtMost(width)
+                val y0 = (cy - r).coerceAtLeast(0)
+                val y1 = (cy + r).coerceAtMost(height)
+                var y = y0
+                while (y < y1) {
+                    var x = x0
+                    while (x < x1) { body(x, y); x += step }
+                    y += step
+                }
+            }
+            METER_CENTER -> {
+                // Central 30% disc.
+                val cx = width / 2
+                val cy = height / 2
+                val r = (0.30f * shorter).toInt()
+                val r2 = r.toLong() * r
+                var y = (cy - r).coerceAtLeast(0)
+                val yEnd = (cy + r).coerceAtMost(height)
+                while (y < yEnd) {
+                    var x = (cx - r).coerceAtLeast(0)
+                    val xEnd = (cx + r).coerceAtMost(width)
+                    while (x < xEnd) {
+                        val dx = (x - cx).toLong()
+                        val dy = (y - cy).toLong()
+                        if (dx * dx + dy * dy <= r2) body(x, y)
+                        x += step
+                    }
+                    y += step
+                }
+            }
+            METER_EDGE -> {
+                // Annulus from 70% to 100% of the mask circle — this is the
+                // mirror-tube case, where the glare sits on the tube's ring.
+                val cx = width / 2
+                val cy = height / 2
+                val rOut = (shorter * (maskRadiusRef / MASK_REF_HEIGHT)).toInt()
+                    .coerceIn(2, shorter / 2)
+                val rIn = (0.70f * rOut).toInt()
+                val rOut2 = rOut.toLong() * rOut
+                val rIn2 = rIn.toLong() * rIn
+                var y = (cy - rOut).coerceAtLeast(0)
+                val yEnd = (cy + rOut).coerceAtMost(height)
+                while (y < yEnd) {
+                    var x = (cx - rOut).coerceAtLeast(0)
+                    val xEnd = (cx + rOut).coerceAtMost(width)
+                    while (x < xEnd) {
+                        val dx = (x - cx).toLong()
+                        val dy = (y - cy).toLong()
+                        val d2 = dx * dx + dy * dy
+                        if (d2 in rIn2..rOut2) body(x, y)
+                        x += step
+                    }
+                    y += step
+                }
+            }
+        }
+    }
+
+    /**
+     * One proportional control step on the camera's brightness control.
+     *
+     * Deliberately drives the camera rather than the shader brightness slider:
+     * blown-out glare is clipped, and no amount of post-processing recovers
+     * detail that the sensor never captured.
+     */
+    private fun stepBrightness(meanLuma: Int) {
+        val camera = getCurrentCamera() as? CameraUVC ?: return
+        val error = targetLuma - meanLuma          // positive means too dark
+        if (abs(error) <= LUMA_DEADBAND) {
+            postMeterStatus(meanLuma, null, settled = true)
+            return
+        }
+        try {
+            val current = camera.getBrightness() ?: return
+            var delta = (error / 8).coerceIn(-METER_MAX_STEP, METER_MAX_STEP)
+            if (delta == 0) delta = if (error > 0) 1 else -1
+            val next = (current + delta).coerceIn(BRIGHTNESS_MIN, BRIGHTNESS_MAX)
+            if (next != current) camera.setBrightness(next)
+            postMeterStatus(meanLuma, next, settled = false)
+        } catch (e: Exception) {
+            writeLog("stepBrightness: EXCEPTION - ${e.message}")
+        }
+    }
+
+    private fun resetExposure() {
+        meterMode = METER_OFF
+        syncScopeUi()
+        try {
+            (getCurrentCamera() as? CameraUVC)?.setBrightness(BRIGHTNESS_DEFAULT)
+            writeLog("resetExposure: brightness -> $BRIGHTNESS_DEFAULT, metering off")
+        } catch (e: Exception) {
+            writeLog("resetExposure: EXCEPTION - ${e.message}")
+        }
+        updateMeterStatus("Exposure reset — metering off")
+    }
+
+    private fun postMeterStatus(meanLuma: Int, brightness: Int?, settled: Boolean) {
+        val text = buildString {
+            append("luma $meanLuma / target $targetLuma")
+            if (brightness != null) append("  ·  brightness $brightness")
+            append(if (settled) "  ·  settled" else "  ·  adjusting")
+            append("  ·  $meterMode")
+        }
+        runOnUiThread { updateMeterStatus(text) }
+    }
+
+    private fun updateMeterStatus(text: String) {
+        binding.meterStatusText.text = text
+        binding.stripMeterStatusText?.text = text
     }
 
     private fun setupCollapsibleSections() {
@@ -2005,6 +2526,9 @@ private fun showStillCapturedFeedback() {
         controlRow?.visibility = if (section == StripSection.IMAGE) View.VISIBLE else View.GONE
         cameraContent?.visibility = if (section == StripSection.CAMERA) View.VISIBLE else View.GONE
         transformContent?.visibility = if (section == StripSection.TRANSFORM) View.VISIBLE else View.GONE
+        // Scope + metering rides along with the CAM tab
+        binding.stripScopeContent?.visibility =
+            if (section == StripSection.CAMERA) View.VISIBLE else View.GONE
 
         if (section == StripSection.IMAGE) {
             updateStripImageControl()
