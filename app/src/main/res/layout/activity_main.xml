@@ -291,9 +291,9 @@
                 android:paddingHorizontal="12dp" />
         </LinearLayout>
 
-        <!-- Scope + metering content (shown with the CAM tab) -->
+        <!-- Mask + metering content (shown with the CAM tab) -->
         <LinearLayout
-            android:id="@+id/stripScopeContent"
+            android:id="@+id/stripMaskContent"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
@@ -308,10 +308,10 @@
                 android:gravity="center_vertical">
 
                 <CheckBox
-                    android:id="@+id/stripScopeCheckBox"
+                    android:id="@+id/stripMaskCheckBox"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Scope"
+                    android:text="Mask"
                     android:textColor="@color/text_secondary"
                     android:textSize="11sp" />
 
@@ -708,7 +708,7 @@
                         android:focusable="true"
                         android:focusableInTouchMode="true" />
 
-                    <!-- ===== Scope mode (mirror-tube circular mask) ===== -->
+                    <!-- ===== Mask (mirror-tube circular clip) ===== -->
                     <View
                         android:layout_width="match_parent"
                         android:layout_height="1dp"
@@ -716,10 +716,10 @@
                         android:layout_marginTop="12dp" />
 
                     <CheckBox
-                        android:id="@+id/scopeModeCheckBox"
+                        android:id="@+id/maskModeCheckBox"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="Scope mode (circular mask)"
+                        android:text="Mask (circular)"
                         android:textColor="@color/text_secondary"
                         android:textSize="12sp"
                         android:layout_marginTop="8dp" />

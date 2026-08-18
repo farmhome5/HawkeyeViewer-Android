@@ -103,7 +103,7 @@ class MainActivity : CameraActivity() {
     private var currentStripSection = StripSection.IMAGE
     private var currentImageControlIndex = 0
 
-    // Scope mode: circular mask over the preview, for mirror-tube use.
+    // Mask: circular clip over the preview, for mirror-tube use.
     // maskRadiusRef is in px of a 720-tall reference frame, same units as the
     // Windows viewer's Mask Radius slider (100..360, 360 = inscribed circle).
     private var maskOn = false
@@ -124,10 +124,11 @@ class MainActivity : CameraActivity() {
     @Volatile private var meterDiagPending = false
 
     // Guards the two UI copies (panel + strip) against listener feedback loops.
-    private var scopeUiSyncing = false
+    private var maskUiSyncing = false
 
     // One-shot: raw-frame spot metering misalignment warning, reset on each tap.
     @Volatile private var rawSpotWarningIssued = false
+    private var lastMeterLogMs = 0L
 
     private val previewDataCallback = object : IPreviewDataCallBack {
         override fun onPreviewData(data: ByteArray?, width: Int, height: Int, format: IPreviewDataCallBack.DataFormat) {
@@ -187,14 +188,15 @@ class MainActivity : CameraActivity() {
         private const val BRIGHTNESS_MIN = 0
         private const val BRIGHTNESS_MAX = 100
         private const val BRIGHTNESS_DEFAULT = 50
+        private const val METER_LOG_INTERVAL_MS = 500L
 
         // The RGBA preview buffer comes from glReadPixels, whose origin is
         // bottom-left, so buffer row 0 is the bottom of the displayed image.
         private const val RGBA_BUFFER_Y_FLIPPED = true
 
         private const val PREFS_NAME = "image_adjustments"
-        private const val PREF_MASK_ON = "scope_mask_on"
-        private const val PREF_MASK_RADIUS = "scope_mask_radius"
+        private const val PREF_MASK_ON = "mask_on"
+        private const val PREF_MASK_RADIUS = "mask_radius"
     }
 
     private fun writeLog(message: String) {
@@ -298,6 +300,10 @@ class MainActivity : CameraActivity() {
                 // Re-apply mirror/flip transform (needed after resume)
                 updateTransform()
                 addPreviewDataCallBack(previewDataCallback)
+
+                // One-shot: does this camera actually respond to the exposure
+                // controls the metering loop drives?
+                probeExposureControls()
 
                 // Log storage location
                 if (isUsingRemovableStorage()) {
@@ -498,7 +504,7 @@ class MainActivity : CameraActivity() {
         setupCameraControls()
         setupImageControls()
         setupTransformControls()
-        setupScopeControls()
+        setupMaskControls()
         setupCollapsibleSections()
         setupZoomPan()
 
@@ -1265,27 +1271,27 @@ class MainActivity : CameraActivity() {
      * settings panel and in the phone adjust strip (the phone's Settings button
      * opens the strip, not the panel, so the strip copy is the one that matters
      * on a handset). Both drive the same state through the set* helpers below,
-     * and syncScopeUi pushes state back to whichever views are present.
+     * and syncMaskUi pushes state back to whichever views are present.
      */
-    private fun setupScopeControls() {
-        restoreScopeSettings()
+    private fun setupMaskControls() {
+        restoreMaskSettings()
 
         // --- Scope mode toggle ---
         val scopeToggle = { _: android.widget.CompoundButton, checked: Boolean ->
-            if (!scopeUiSyncing) setScopeMask(checked)
+            if (!maskUiSyncing) setMaskEnabled(checked)
         }
-        binding.scopeModeCheckBox.setOnCheckedChangeListener(scopeToggle)
-        binding.stripScopeCheckBox?.setOnCheckedChangeListener(scopeToggle)
+        binding.maskModeCheckBox.setOnCheckedChangeListener(scopeToggle)
+        binding.stripMaskCheckBox?.setOnCheckedChangeListener(scopeToggle)
 
         // --- Mask radius. SeekBar has no android:min below API 26, so the bar is
         // 0..260 and MASK_RADIUS_MIN is added to get the 100..360 slider value. ---
         val radiusListener = object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                if (!fromUser || scopeUiSyncing) return
+                if (!fromUser || maskUiSyncing) return
                 setMaskRadius(progress + MASK_RADIUS_MIN)
             }
             override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) { saveScopeSettings() }
+            override fun onStopTrackingTouch(seekBar: SeekBar?) { saveMaskSettings() }
         }
         binding.maskRadiusSeekBar.setOnSeekBarChangeListener(radiusListener)
         binding.stripMaskRadiusSeekBar?.setOnSeekBarChangeListener(radiusListener)
@@ -1297,7 +1303,7 @@ class MainActivity : CameraActivity() {
         }
         val meterListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                if (scopeUiSyncing || position !in METER_MODES.indices) return
+                if (maskUiSyncing || position !in METER_MODES.indices) return
                 setMeterMode(METER_MODES[position])
             }
             override fun onNothingSelected(parent: AdapterView<*>?) {}
@@ -1319,28 +1325,28 @@ class MainActivity : CameraActivity() {
             }
         }
 
-        syncScopeUi()
+        syncMaskUi()
         applyMask()
     }
 
-    private fun setScopeMask(on: Boolean) {
+    private fun setMaskEnabled(on: Boolean) {
         maskOn = on
         applyMask()
-        syncScopeUi()
-        saveScopeSettings()
-        writeLog("Scope mode ${if (on) "on" else "off"} (radius=$maskRadiusRef)")
+        syncMaskUi()
+        saveMaskSettings()
+        writeLog("Mask ${if (on) "on" else "off"} (radius=$maskRadiusRef)")
     }
 
     private fun setMaskRadius(value: Int) {
         maskRadiusRef = value.coerceIn(MASK_RADIUS_MIN, MASK_RADIUS_MAX)
         applyMask()
-        syncScopeUi()
+        syncMaskUi()
     }
 
     private fun setMeterMode(mode: String) {
         meterMode = mode
         meterFrameCounter = 0
-        syncScopeUi()
+        syncMaskUi()
         writeLog("Metering mode -> $mode (target=$targetLuma)")
         if (mode == METER_OFF) {
             updateMeterStatus("Metering off — tap the preview to meter a spot")
@@ -1348,11 +1354,11 @@ class MainActivity : CameraActivity() {
     }
 
     /** Pushes current scope/metering state into both UI copies without re-entering listeners. */
-    private fun syncScopeUi() {
-        scopeUiSyncing = true
+    private fun syncMaskUi() {
+        maskUiSyncing = true
         try {
-            binding.scopeModeCheckBox.isChecked = maskOn
-            binding.stripScopeCheckBox?.isChecked = maskOn
+            binding.maskModeCheckBox.isChecked = maskOn
+            binding.stripMaskCheckBox?.isChecked = maskOn
 
             val progress = maskRadiusRef - MASK_RADIUS_MIN
             binding.maskRadiusSeekBar.progress = progress
@@ -1368,7 +1374,7 @@ class MainActivity : CameraActivity() {
                 if (it.selectedItemPosition != index) it.setSelection(index)
             }
         } finally {
-            scopeUiSyncing = false
+            maskUiSyncing = false
         }
     }
 
@@ -1409,14 +1415,14 @@ class MainActivity : CameraActivity() {
         container.invalidateOutline()
     }
 
-    private fun saveScopeSettings() {
+    private fun saveMaskSettings() {
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
             .putBoolean(PREF_MASK_ON, maskOn)
             .putInt(PREF_MASK_RADIUS, maskRadiusRef)
             .apply()
     }
 
-    private fun restoreScopeSettings() {
+    private fun restoreMaskSettings() {
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         maskOn = prefs.getBoolean(PREF_MASK_ON, false)
         maskRadiusRef = prefs.getInt(PREF_MASK_RADIUS, MASK_RADIUS_DEFAULT)
@@ -1440,7 +1446,7 @@ class MainActivity : CameraActivity() {
         meterDiagPending = true
         rawSpotWarningIssued = false
         // Keep both spinner copies in sync when metering is driven by a tap.
-        syncScopeUi()
+        syncMaskUi()
         writeLog("meterAt x=%.3f y=%.3f".format(meterX, meterY))
         showMeterReticle(fx, fy)
     }
@@ -1656,27 +1662,104 @@ class MainActivity : CameraActivity() {
      * detail that the sensor never captured.
      */
     private fun stepBrightness(meanLuma: Int) {
-        val camera = getCurrentCamera() as? CameraUVC ?: return
+        val camera = getCurrentCamera() as? CameraUVC
+        if (camera == null) {
+            logMeterThrottled("stepBrightness: no CameraUVC — cannot adjust")
+            return
+        }
         val error = targetLuma - meanLuma          // positive means too dark
         if (abs(error) <= LUMA_DEADBAND) {
             postMeterStatus(meanLuma, null, settled = true)
             return
         }
         try {
-            val current = camera.getBrightness() ?: return
+            val current = camera.getBrightness()
+            if (current == null) {
+                logMeterThrottled("stepBrightness: getBrightness() null — control unavailable")
+                return
+            }
             var delta = (error / 8).coerceIn(-METER_MAX_STEP, METER_MAX_STEP)
             if (delta == 0) delta = if (error > 0) 1 else -1
             val next = (current + delta).coerceIn(BRIGHTNESS_MIN, BRIGHTNESS_MAX)
-            if (next != current) camera.setBrightness(next)
+            if (next == current) {
+                // Either the control is railed, or its range came back as zero and
+                // getBrightness() is pinned at 0 — in both cases nothing will move.
+                logMeterThrottled(
+                    "stepBrightness: STUCK luma=$meanLuma err=$error " +
+                        "brightness=$current delta=$delta -> next=$next (no call made). " +
+                        "Control is railed or unsupported; see the exposure probe above."
+                )
+                postMeterStatus(meanLuma, current, settled = false)
+                return
+            }
+            camera.setBrightness(next)
+            val readBack = camera.getBrightness()
+            logMeterThrottled(
+                "stepBrightness: luma=$meanLuma err=$error " +
+                    "brightness $current -> $next, read back $readBack" +
+                    if (readBack != next) "  << DID NOT TAKE" else ""
+            )
             postMeterStatus(meanLuma, next, settled = false)
         } catch (e: Exception) {
             writeLog("stepBrightness: EXCEPTION - ${e.message}")
         }
     }
 
+    /** Rate-limits metering diagnostics so the loop cannot flood the log file. */
+    private fun logMeterThrottled(message: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastMeterLogMs < METER_LOG_INTERVAL_MS) return
+        lastMeterLogMs = now
+        writeLog(message)
+    }
+
+    /**
+     * One-shot probe of the camera's exposure-related PU controls.
+     *
+     * A UVC camera that does not support a control reports a zero min/max range,
+     * at which point setBrightness() silently no-ops and getBrightness() always
+     * returns 0 — indistinguishable from a working control sitting at 0 unless
+     * you write a value and read it back. This does exactly that, then restores
+     * whatever was there, so one launch says whether the loop can work at all.
+     */
+    private fun probeExposureControls() {
+        val camera = getCurrentCamera() as? CameraUVC ?: run {
+            writeLog("exposure probe: no CameraUVC available")
+            return
+        }
+        try {
+            val startBrightness = camera.getBrightness()
+            val startContrast = camera.getContrast()
+            writeLog("exposure probe: initial brightness=$startBrightness contrast=$startContrast")
+
+            for (probe in intArrayOf(20, 80)) {
+                camera.setBrightness(probe)
+                val got = camera.getBrightness()
+                writeLog(
+                    "exposure probe: brightness set=$probe read=$got " +
+                        if (got == probe) "OK" else "MISMATCH (control likely unsupported)"
+                )
+            }
+            camera.setBrightness(startBrightness ?: BRIGHTNESS_DEFAULT)
+
+            for (probe in intArrayOf(20, 80)) {
+                camera.setContrast(probe)
+                val got = camera.getContrast()
+                writeLog(
+                    "exposure probe: contrast set=$probe read=$got " +
+                        if (got == probe) "OK" else "MISMATCH (control likely unsupported)"
+                )
+            }
+            camera.setContrast(startContrast ?: BRIGHTNESS_DEFAULT)
+            writeLog("exposure probe: restored brightness=$startBrightness contrast=$startContrast")
+        } catch (e: Exception) {
+            writeLog("exposure probe: EXCEPTION - ${e.message}")
+        }
+    }
+
     private fun resetExposure() {
         meterMode = METER_OFF
-        syncScopeUi()
+        syncMaskUi()
         try {
             (getCurrentCamera() as? CameraUVC)?.setBrightness(BRIGHTNESS_DEFAULT)
             writeLog("resetExposure: brightness -> $BRIGHTNESS_DEFAULT, metering off")
@@ -2527,7 +2610,7 @@ private fun showStillCapturedFeedback() {
         cameraContent?.visibility = if (section == StripSection.CAMERA) View.VISIBLE else View.GONE
         transformContent?.visibility = if (section == StripSection.TRANSFORM) View.VISIBLE else View.GONE
         // Scope + metering rides along with the CAM tab
-        binding.stripScopeContent?.visibility =
+        binding.stripMaskContent?.visibility =
             if (section == StripSection.CAMERA) View.VISIBLE else View.GONE
 
         if (section == StripSection.IMAGE) {

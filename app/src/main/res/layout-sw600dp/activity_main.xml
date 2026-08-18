@@ -395,7 +395,7 @@
                         android:focusable="true"
                         android:focusableInTouchMode="true" />
 
-                    <!-- ===== Scope mode (mirror-tube circular mask) ===== -->
+                    <!-- ===== Mask (mirror-tube circular clip) ===== -->
                     <View
                         android:layout_width="match_parent"
                         android:layout_height="1dp"
@@ -403,10 +403,10 @@
                         android:layout_marginTop="12dp" />
 
                     <CheckBox
-                        android:id="@+id/scopeModeCheckBox"
+                        android:id="@+id/maskModeCheckBox"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="Scope mode (circular mask)"
+                        android:text="Mask (circular)"
                         android:textColor="@color/text_secondary"
                         android:textSize="12sp"
                         android:layout_marginTop="8dp" />
