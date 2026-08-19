@@ -724,6 +724,8 @@ class MainActivity : CameraActivity() {
 
     private fun applyZoomPan() {
         setZoomPan(currentZoom, currentPanX, currentPanY)
+        // The mask is image-locked, so every zoom/pan change moves it too.
+        if (maskOn) binding.cameraContainer.invalidateOutline()
         showZoomOverlay()
         updateZoomDragButtonStates()
     }
@@ -1300,11 +1302,25 @@ class MainActivity : CameraActivity() {
                     outline.setRect(0, 0, w, h)
                     return
                 }
-                // Radius scales off the shorter side so the circle always fits.
-                val r = (min(w, h) * (maskRadiusRef / MASK_REF_HEIGHT)).toInt()
-                    .coerceIn(1, min(w, h) / 2)
-                val cx = w / 2
-                val cy = h / 2
+                // The mask is locked to the IMAGE, not the screen. It marks the
+                // region of the sensor image that reflects properly through the
+                // prism/mirror adapter, so it must ride the same zoom/pan the GL
+                // renderer applies to the image (base_vertex.glsl:
+                // screen = (tex - 0.5 + pan) * zoom + 0.5). Zooming in grows the
+                // circle off the edges of the view — everything inside it is valid
+                // image, so zoom must never let the ring cover good pixels — and
+                // dragging brings its edge back into view along with the image
+                // boundary it belongs to. At zoom 1 / no pan this reduces to the
+                // old centred circle. uCropZoom is deliberately excluded: the
+                // aspect crop is constant per view mode and the operator
+                // calibrates the radius slider with it already in effect.
+                //
+                // Radius scales off the shorter side; pan y is negated because
+                // GL texture y runs bottom-up while view y runs top-down.
+                val baseR = min(w, h) * (maskRadiusRef / MASK_REF_HEIGHT)
+                val r = (baseR * currentZoom).toInt().coerceAtLeast(1)
+                val cx = (w / 2f + currentPanX * currentZoom * w).toInt()
+                val cy = (h / 2f - currentPanY * currentZoom * h).toInt()
                 outline.setOval(cx - r, cy - r, cx + r, cy + r)
             }
         }
