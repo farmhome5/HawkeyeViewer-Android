@@ -34,3 +34,4 @@ google-services.json
 *.hprof
 node_modules/
 nul
+key.properties
