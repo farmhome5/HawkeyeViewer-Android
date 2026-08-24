@@ -21,8 +21,8 @@ android {
         applicationId = "com.hawkeyeborescopes.viewer"
         minSdk = 24  // Android 7.0 - good balance for UVC camera support
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0-mask"
+        versionCode = 2
+        versionName = "1.4.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
