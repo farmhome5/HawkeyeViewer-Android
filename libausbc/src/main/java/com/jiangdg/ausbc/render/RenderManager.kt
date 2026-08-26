@@ -523,6 +523,17 @@ class RenderManager(
                             mEncodeRender?.sharpness = sr.sharpness
                             mEncodeRender?.texelWidth = sr.texelWidth
                             mEncodeRender?.texelHeight = sr.texelHeight
+                            // WYSIWYG recordings: the encode render is created
+                            // fresh at record-start, so carry over the geometry
+                            // state too, or recordings silently lose the current
+                            // zoom/pan/crop and the mirror-tube mask.
+                            mEncodeRender?.zoom = sr.zoom
+                            mEncodeRender?.panX = sr.panX
+                            mEncodeRender?.panY = sr.panY
+                            mEncodeRender?.cropZoomX = sr.cropZoomX
+                            mEncodeRender?.cropZoomY = sr.cropZoomY
+                            mEncodeRender?.maskOn = sr.maskOn
+                            mEncodeRender?.maskR = sr.maskR
                         }
                     }
                 }

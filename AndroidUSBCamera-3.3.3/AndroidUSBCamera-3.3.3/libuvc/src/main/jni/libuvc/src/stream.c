@@ -1828,11 +1828,12 @@ uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
 					libusb_free_transfer(strmh->transfers[i]);
 					strmh->transfers[i] = NULL; */
 				}
-				if (res == LIBUSB_ERROR_NOT_FOUND && strmh->transfers[i] != NULL) {
-                    free(strmh->transfers[i]->buffer);
-                    // libusb_free_transfer(strmh->transfers[i]);
-                    strmh->transfers[i] = NULL;
-                }
+				/* NOT_FOUND does NOT mean the transfer is finished with: it also
+				 * covers "completed, callback still queued for delivery". Nulling
+				 * the slot here made the wait below think everything had drained,
+				 * uvc_stream_close() destroyed cb_mutex, and the queued callback
+				 * then locked the destroyed mutex (field FORTIFY aborts). The
+				 * callback owns clearing the slot - leave it alone and wait. */
 			}
 		}
 
@@ -1903,18 +1904,46 @@ void uvc_stream_close(uvc_stream_handle_t *strmh) {
 	uvc_release_if(strmh->devh, strmh->stream_if->bInterfaceNumber);
 
 	{
-		/* If any transfer is still pending after stop's wait, its cancellation
-		 * callback (_uvc_delete_transfer) will still lock cb_mutex and touch
-		 * this handle. Destroying/freeing now is a crash (seen in the field as
-		 * a FORTIFY abort); deliberately leaking one stream handle is the
-		 * lesser evil. */
-		int pending;
-		for (pending = 0; pending < LIBUVC_NUM_TRANSFER_BUFS; pending++) {
-			if (strmh->transfers[pending] != NULL) {
-				LOGW("uvc_stream_close: transfer %d still pending - leaking stream handle instead of crashing", pending);
-				DL_DELETE(strmh->devh->streams, strmh);
-				UVC_EXIT_VOID();
+		/* Transfers can still be in flight here: uvc_stream_stop's wait can
+		 * time out, and it returns early without waiting at all when the
+		 * camera already flagged itself stopped (running == 0 after an
+		 * unexpected disconnect - these auto-power-off scopes do exactly
+		 * that). Their callbacks (_uvc_delete_transfer / _uvc_process_payload)
+		 * lock cb_mutex and touch this handle, so give them a bounded chance
+		 * to drain, and if any remain, deliberately leak this one stream
+		 * handle: a leak on an anomalous teardown beats a FORTIFY abort or a
+		 * use-after-free. */
+		int pending = 0;
+		int i2, waits = 0;
+		struct timespec ts2;
+		pthread_mutex_lock(&strmh->cb_mutex);
+		for (;;) {
+			pending = 0;
+			for (i2 = 0; i2 < LIBUVC_NUM_TRANSFER_BUFS; i2++) {
+				if (strmh->transfers[i2] != NULL)
+					pending++;
 			}
+			if (!pending || waits >= 3)
+				break;
+#if _POSIX_TIMERS > 0
+			clock_gettime(CLOCK_REALTIME, &ts2);
+#else
+			{
+				struct timeval tv2;
+				gettimeofday(&tv2, NULL);
+				ts2.tv_sec = tv2.tv_sec;
+				ts2.tv_nsec = tv2.tv_usec * 1000;
+			}
+#endif
+			ts2.tv_sec += 1;
+			pthread_cond_timedwait(&strmh->cb_cond, &strmh->cb_mutex, &ts2);
+			waits++;
+		}
+		pthread_mutex_unlock(&strmh->cb_mutex);
+		if (pending) {
+			LOGW("uvc_stream_close: %d transfer(s) still pending after waiting - leaking stream handle instead of crashing", pending);
+			DL_DELETE(strmh->devh->streams, strmh);
+			UVC_EXIT_VOID();
 		}
 	}
 
