@@ -557,7 +557,30 @@ class MultiCameraClient(ctx: Context, callback: IDeviceConnectCallBack?) {
         }
 
         fun setCropZoom(cropZoomX: Float, cropZoomY: Float) {
+            mEncodeCropZoomX = cropZoomX
+            mEncodeCropZoomY = cropZoomY
             mRenderManager?.setCropZoom(cropZoomX, cropZoomY)
+        }
+
+        private var mEncodeCropZoomX = 1.0f
+        private var mEncodeCropZoomY = 1.0f
+
+        /**
+         * Video dimensions for the current view mode: the aspect-CROPPED frame,
+         * even-aligned for the codec. Encoding at the raw camera size while the
+         * GL pipeline renders the cropped view stretched recordings on cameras
+         * whose frame is wider than the crop (LTC 1280x720 at 1:1 -> oval mask);
+         * cropped dimensions also match the Windows viewer, which records at the
+         * cropped-native resolution.
+         */
+        private fun encodeSize(): Pair<Int, Int> {
+            val w = mCameraRequest?.previewWidth ?: 640
+            val h = mCameraRequest?.previewHeight ?: 480
+            val cx = if (mEncodeCropZoomX > 1f) mEncodeCropZoomX else 1f
+            val cy = if (mEncodeCropZoomY > 1f) mEncodeCropZoomY else 1f
+            val ew = ((w / cx).toInt() / 2) * 2
+            val eh = ((h / cy).toInt() / 2) * 2
+            return Pair(ew.coerceAtLeast(2), eh.coerceAtLeast(2))
         }
 
         /**
@@ -883,6 +906,10 @@ class MultiCameraClient(ctx: Context, callback: IDeviceConnectCallBack?) {
                 Logger.w(TAG, "capturing video already running")
                 return
             }
+            // Recreate the encoder at the current view mode's cropped size, so
+            // the video aspect matches what the GL pipeline renders (WYSIWYG).
+            val (encodeW, encodeH) = encodeSize()
+            initEncodeProcessor(encodeW, encodeH)
             captureStreamStartInternal()
             Mp4Muxer(mContext, callBack, path, durationInSec, mAudioProcess==null).apply {
                 mVideoProcess?.setMp4Muxer(this, true)
@@ -945,8 +972,8 @@ class MultiCameraClient(ctx: Context, callback: IDeviceConnectCallBack?) {
                 Logger.e(TAG, "start encode failed, input surface is null")
                 return
             }
-            mCameraRequest?.apply {
-                mRenderManager?.startRenderCodec(surface, previewWidth, previewHeight)
+            encodeSize().let { (encodeW, encodeH) ->
+                mRenderManager?.startRenderCodec(surface, encodeW, encodeH)
             }
         }
 
