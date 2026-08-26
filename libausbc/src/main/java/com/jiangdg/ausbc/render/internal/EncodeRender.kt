@@ -52,7 +52,8 @@ class EncodeRender(context: Context): AbstractRender(context) {
     @Volatile var panX: Float = 0.0f
     @Volatile var panY: Float = 0.0f
     @Volatile var maskOn: Float = 0.0f
-    @Volatile var maskR: Float = 0.39f
+    @Volatile var maskRx: Float = 0.39f
+    @Volatile var maskRy: Float = 0.39f
     @Volatile var cropZoomX: Float = 1.0f
     @Volatile var cropZoomY: Float = 1.0f
 
@@ -83,7 +84,7 @@ class EncodeRender(context: Context): AbstractRender(context) {
         mPanHandle = GLES20.glGetUniformLocation(mProgram, "uPan")
         mCropZoomHandle = GLES20.glGetUniformLocation(mProgram, "uCropZoom")
         mMaskOnHandle = GLES20.glGetUniformLocation(mProgram, "uMaskOn")
-        mMaskRHandle = GLES20.glGetUniformLocation(mProgram, "uMaskR")
+        mMaskRHandle = GLES20.glGetUniformLocation(mProgram, "uMaskRxy")
     }
 
     override fun setSize(width: Int, height: Int) {
@@ -106,7 +107,7 @@ class EncodeRender(context: Context): AbstractRender(context) {
         if (mPanHandle >= 0) GLES20.glUniform2f(mPanHandle, panX, panY)
         if (mCropZoomHandle >= 0) GLES20.glUniform2f(mCropZoomHandle, cropZoomX, cropZoomY)
         if (mMaskOnHandle >= 0) GLES20.glUniform1f(mMaskOnHandle, maskOn)
-        if (mMaskRHandle >= 0) GLES20.glUniform1f(mMaskRHandle, maskR)
+        if (mMaskRHandle >= 0) GLES20.glUniform2f(mMaskRHandle, maskRx, maskRy)
     }
 
     override fun clear() {

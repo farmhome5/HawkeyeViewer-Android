@@ -12,9 +12,8 @@ uniform float uGamma;      // 0.0 = use default (1.0), else gamma value
 uniform float uSharpness;  // 0.0 = no sharpen, >0.0 = sharpen amount (0-2.0)
 uniform vec2  uTexelSize;  // 1.0/width, 1.0/height for neighbor sampling
 uniform float uMaskOn;     // >0.5 = mirror-tube circular mask enabled
-uniform float uMaskR;      // mask radius as a fraction of the visible image's shorter side
-uniform vec2  uCropZoom;   // shared with the vertex stage; needed to size the mask
-                           // against the visible (aspect-cropped) image
+uniform vec2  uMaskRxy;    // mask radii in TEXTURE units (precomputed on the CPU
+                           // from radius fraction, texture size and crop)
 
 // Luminance weights (Rec. 709)
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
@@ -88,16 +87,13 @@ void main()
 
     // 7. Mirror-tube mask, baked into every consumer of this shader (screen,
     // still capture, video encode) so recordings are WYSIWYG like the Windows
-    // app. Computed in texture space, so it stays locked to the image under
-    // zoom/pan, and scaled by uCropZoom so the radius is a fraction of the
-    // VISIBLE (aspect-cropped) image's shorter side - the same geometry as
-    // the on-screen clip.
-    if (uMaskOn > 0.5 && uTexelSize.x > 0.0 && uTexelSize.y > 0.0) {
-        vec2 pxPos = (vTextureCoord - 0.5) / uTexelSize;
-        vec2 crop = max(uCropZoom, vec2(0.001));
-        vec2 visPx = vec2(1.0 / uTexelSize.x, 1.0 / uTexelSize.y) / crop;
-        float visMin = min(visPx.x, visPx.y);
-        if (length(pxPos) > uMaskR * visMin) color.rgb = vec3(0.0);
+    // app. The circle is evaluated in texture space, so it stays locked to
+    // the image under zoom/pan for free; the radii arrive precomputed in
+    // texture units (a circle on the image is an ellipse in normalized
+    // texture coords when the frame is not square).
+    if (uMaskOn > 0.5 && uMaskRxy.x > 0.0 && uMaskRxy.y > 0.0) {
+        vec2 md = (vTextureCoord - 0.5) / uMaskRxy;
+        if (dot(md, md) > 1.0) color.rgb = vec3(0.0);
     }
 
     gl_FragColor = vec4(clamp(color.rgb, 0.0, 1.0), color.a);

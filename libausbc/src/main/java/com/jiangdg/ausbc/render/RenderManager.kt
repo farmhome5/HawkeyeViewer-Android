@@ -140,6 +140,9 @@ class RenderManager(
                     mScreenRender?.setSize(mWidth, mHeight)
                     mCaptureRender?.setSize(mWidth, mHeight)
                     mCameraSurfaceTexture?.setDefaultBufferSize(mWidth, mHeight)
+                    // Mask radii depend on the render size; recompute in case the
+                    // mask was configured before the first size message arrived.
+                    applyMaskToRenders()
                 }
             }
             MSG_GL_SAVE_IMAGE -> {
@@ -267,20 +270,19 @@ class RenderManager(
 
                         mEncodeRender?.cropZoomX = values[0]
                         mEncodeRender?.cropZoomY = values[1]
+
+                        mCropZoomXCache = values[0]
+                        mCropZoomYCache = values[1]
+                        applyMaskToRenders()
                     }
                 }
             }
             MSG_GL_SET_MASK -> {
                 (msg.obj as? FloatArray)?.let { values ->
                     if (values.size >= 2) {
-                        mScreenRender?.maskOn = values[0]
-                        mScreenRender?.maskR = values[1]
-
-                        mCaptureRender?.maskOn = values[0]
-                        mCaptureRender?.maskR = values[1]
-
-                        mEncodeRender?.maskOn = values[0]
-                        mEncodeRender?.maskR = values[1]
+                        mMaskOn = values[0]
+                        mMaskFrac = values[1]
+                        applyMaskToRenders()
                     }
                 }
             }
@@ -477,6 +479,35 @@ class RenderManager(
         mRenderHandler?.obtainMessage(MSG_GL_SET_MASK, values)?.sendToTarget()
     }
 
+    @Volatile private var mMaskOn = 0.0f
+    @Volatile private var mMaskFrac = 0.39f
+    @Volatile private var mCropZoomXCache = 1.0f
+    @Volatile private var mCropZoomYCache = 1.0f
+
+    /**
+     * Converts the mask fraction into texture-space radii and pushes them to
+     * every render. The circle is r = frac * (shorter side of the VISIBLE,
+     * aspect-cropped image); expressed in normalized texture coords that is an
+     * ellipse (rx, ry). Runs on the GL handler thread.
+     */
+    private fun applyMaskToRenders() {
+        val w = mWidth.toFloat()
+        val h = mHeight.toFloat()
+        if (w <= 0f || h <= 0f) return
+        val visMin = minOf(w / maxOf(mCropZoomXCache, 0.001f), h / maxOf(mCropZoomYCache, 0.001f))
+        val rx = mMaskFrac * visMin / w
+        val ry = mMaskFrac * visMin / h
+        mScreenRender?.maskOn = mMaskOn
+        mScreenRender?.maskRx = rx
+        mScreenRender?.maskRy = ry
+        mCaptureRender?.maskOn = mMaskOn
+        mCaptureRender?.maskRx = rx
+        mCaptureRender?.maskRy = ry
+        mEncodeRender?.maskOn = mMaskOn
+        mEncodeRender?.maskRx = rx
+        mEncodeRender?.maskRy = ry
+    }
+
     /**
      * Get cache render effect list
      * @return current effects
@@ -533,7 +564,8 @@ class RenderManager(
                             mEncodeRender?.cropZoomX = sr.cropZoomX
                             mEncodeRender?.cropZoomY = sr.cropZoomY
                             mEncodeRender?.maskOn = sr.maskOn
-                            mEncodeRender?.maskR = sr.maskR
+                            mEncodeRender?.maskRx = sr.maskRx
+                            mEncodeRender?.maskRy = sr.maskRy
                         }
                     }
                 }
