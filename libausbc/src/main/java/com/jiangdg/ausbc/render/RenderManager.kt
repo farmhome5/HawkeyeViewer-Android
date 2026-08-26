@@ -494,9 +494,14 @@ class RenderManager(
         val w = mWidth.toFloat()
         val h = mHeight.toFloat()
         if (w <= 0f || h <= 0f) return
-        val visMin = minOf(w / maxOf(mCropZoomXCache, 0.001f), h / maxOf(mCropZoomYCache, 0.001f))
-        val rx = mMaskFrac * visMin / w
-        val ry = mMaskFrac * visMin / h
+        // Display-space circle of radius frac*min(view side), mapped through the
+        // vertex transform t = (o-0.5)/crop + 0.5: each axis's radius divides by
+        // that axis's OWN crop factor. Dividing both by a common factor rendered
+        // an oval on cameras whose frame is center-cropped on one axis only
+        // (LTC 1280x720 at 1:1 view: cropX=1.78, cropY=1).
+        val minV = minOf(w, h)
+        val rx = mMaskFrac * minV / (w * maxOf(mCropZoomXCache, 0.001f))
+        val ry = mMaskFrac * minV / (h * maxOf(mCropZoomYCache, 0.001f))
         mScreenRender?.maskOn = mMaskOn
         mScreenRender?.maskRx = rx
         mScreenRender?.maskRy = ry
