@@ -12,6 +12,7 @@ import android.graphics.Outline
 import android.graphics.Rect
 import android.graphics.YuvImage
 import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
@@ -276,6 +277,13 @@ class MainActivity : CameraActivity() {
                 val camera = self as? CameraUVC
                 if (camera == null) {
                     writeLog("UsbButtonHelper: current camera does not expose CameraUVC bridge hooks")
+                } else if (self.device?.vendorId != 0x0BDF) {
+                    // Physical capture buttons ride the Tilt/Roll controls, which only
+                    // Hawkeye HVR cameras (VID 0x0BDF) implement. On cameras without
+                    // them (e.g. NOVATEK 0x2622 "HDUSB"/LTC), every poll fails, the
+                    // helper spirals into recovery mode, and its constant control
+                    // traffic + interface claims stall the live bulk video stream.
+                    writeLog("UsbButtonHelper: skipped — vendorId=${self.device?.vendorId} has no Tilt/Roll button mapping")
                 } else {
                     buttonHelper = UsbButtonHelper(
                         camera = camera,
@@ -315,6 +323,9 @@ class MainActivity : CameraActivity() {
             }
             ICameraStateCallBack.State.ERROR -> {
                 writeLog("Camera ERROR: $msg")
+                // DIAGNOSTIC: the device is attached at this instant — capture its
+                // raw descriptors even if it drops off the bus moments later.
+                if (msg?.contains("unsupported") == true) dumpUvcFormats()
                 // First requestPermission() after closeCamera() always fails with -99.
                 // Auto-retry once — the second attempt succeeds.
                 if (isStartingCamera && msg?.contains("result=-99") == true) {
@@ -360,6 +371,8 @@ class MainActivity : CameraActivity() {
             setupUI()
             writeLog("UI setup complete, waiting for camera...")
             showStatus("Ready - Connect USB camera")
+            // DIAGNOSTIC: log raw USB descriptors + advertised UVC formats at startup.
+            binding.cameraContainer.post { dumpUvcFormats() }
         } catch (e: Exception) {
             writeLog("FATAL ERROR in initView: ${e.message}")
             writeLog("Stack trace: ${e.stackTraceToString()}")
@@ -898,9 +911,87 @@ class MainActivity : CameraActivity() {
         doStartCamera()
     }
 
+    /**
+     * DIAGNOSTIC: open each USB device we have permission for, read its raw USB
+     * descriptors, and log the full hex blob plus every UVC VideoStreaming format
+     * it advertises. Ground truth straight from the device — independent of what
+     * libusb/libuvc manage to parse — for diagnosing cameras (LTC/NOVATEK) whose
+     * descriptors defeat the native parser.
+     */
+    private fun dumpUvcFormats() {
+        try {
+            val usbManager = ContextCompat.getSystemService(this, UsbManager::class.java)
+            if (usbManager == null) { writeLog("UVC-DESC: no UsbManager"); return }
+            val devices = usbManager.deviceList.values
+            if (devices.isEmpty()) { writeLog("UVC-DESC: no USB devices in deviceList"); return }
+            for (device in devices) {
+                writeLog("UVC-DESC: device=${device.deviceName} vid=${device.vendorId} pid=${device.productId} " +
+                        "product=${device.productName} hasPerm=${usbManager.hasPermission(device)}")
+                if (!usbManager.hasPermission(device)) continue
+                val conn = usbManager.openDevice(device)
+                if (conn == null) { writeLog("UVC-DESC: openDevice failed for ${device.deviceName}"); continue }
+                try {
+                    val raw = conn.rawDescriptors
+                    if (raw == null) { writeLog("UVC-DESC: rawDescriptors null"); continue }
+                    writeLog("UVC-DESC: rawDescriptors len=${raw.size}")
+                    val hex = raw.joinToString("") { String.format("%02X", it.toInt() and 0xFF) }
+                    hex.chunked(120).forEachIndexed { idx, c -> writeLog("UVC-DESC: hex[$idx] $c") }
+                    parseAndLogUvcFormats(raw)
+                } finally {
+                    conn.close()
+                }
+            }
+        } catch (e: Exception) {
+            writeLog("UVC-DESC: error ${e.message}")
+        }
+    }
+
+    /** Walk the concatenated USB descriptor blob and log each VS_FORMAT_* descriptor. */
+    private fun parseAndLogUvcFormats(raw: ByteArray) {
+        var i = 0
+        while (i + 2 < raw.size) {
+            val len = raw[i].toInt() and 0xFF
+            if (len < 2) break  // malformed or end of blob
+            val type = raw[i + 1].toInt() and 0xFF
+            if (type == 0x24) {  // CS_INTERFACE (class-specific)
+                val sub = raw[i + 2].toInt() and 0xFF
+                when (sub) {
+                    // VS_FORMAT_UNCOMPRESSED(0x04) / FRAME_BASED(0x10) / STREAM_BASED(0x12):
+                    // guidFormat is 16 bytes starting at offset +5
+                    0x04, 0x10, 0x12 -> {
+                        if (i + 5 + 16 <= raw.size) {
+                            val guid = raw.copyOfRange(i + 5, i + 5 + 16)
+                            val fourcc = String(guid, 0, 4, Charsets.US_ASCII)
+                                .map { if (it.code in 32..126) it else '.' }.joinToString("")
+                            val guidHex = guid.joinToString(" ") { String.format("%02X", it.toInt() and 0xFF) }
+                            val subName = when (sub) {
+                                0x04 -> "UNCOMPRESSED"; 0x10 -> "FRAME_BASED"; else -> "STREAM_BASED"
+                            }
+                            writeLog("UVC-DESC:   FORMAT $subName fourcc='$fourcc' guid=[$guidHex]")
+                        }
+                    }
+                    0x06 -> writeLog("UVC-DESC:   FORMAT MJPEG")
+                    0x0a -> writeLog("UVC-DESC:   FORMAT MPEG2TS")
+                    0x0d -> writeLog("UVC-DESC:   FORMAT DV")
+                    // VS_FRAME_UNCOMPRESSED(0x05) / FRAME_MJPEG(0x07) / FRAME_FRAME_BASED(0x11):
+                    // wWidth at offset +5, wHeight at offset +7 (little-endian)
+                    0x05, 0x07, 0x11 -> {
+                        if (i + 9 <= raw.size) {
+                            val w = (raw[i + 5].toInt() and 0xFF) or ((raw[i + 6].toInt() and 0xFF) shl 8)
+                            val h = (raw[i + 7].toInt() and 0xFF) or ((raw[i + 8].toInt() and 0xFF) shl 8)
+                            writeLog("UVC-DESC:     frame ${w}x${h}")
+                        }
+                    }
+                }
+            }
+            i += len
+        }
+    }
+
     private fun doStartCamera() {
         if (isCameraActive) return  // guard against stale delayed callback
         writeLog("Start button pressed, requesting device list...")
+        dumpUvcFormats()  // DIAGNOSTIC: log every format the camera advertises
         val devices = getDeviceList()
         if (devices.isNullOrEmpty()) {
             showStatus("No USB camera found")
