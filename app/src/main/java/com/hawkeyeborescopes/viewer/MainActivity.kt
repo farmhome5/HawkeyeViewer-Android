@@ -268,6 +268,30 @@ class MainActivity : CameraActivity() {
                 updateTransform()
                 addPreviewDataCallBack(previewDataCallback)
 
+                // Anti-flicker: a mis-set UVC power-line frequency makes some
+                // cameras' AE pulse (single-frame brightness pops). Force 60 Hz
+                // and log whether the camera honoured it.
+                (self as? CameraUVC)?.let { cam ->
+                    val before = try { cam.getPowerlineFrequency() } catch (e: Exception) { null }
+                    try { cam.setPowerlineFrequency(2) } catch (_: Exception) {}
+                    val after = try { cam.getPowerlineFrequency() } catch (e: Exception) { null }
+                    writeLog("PowerLineFrequency: $before -> $after (requested 60Hz)")
+
+                    // AGC freeze: writing the current gain back as a manual value
+                    // switches many sensors from auto-gain to manual, stopping the
+                    // AE dither that shows as half-bright "flash" frames on the
+                    // ENDO-CAM at its fixed 60 fps. Cameras without a gain control
+                    // (HVR) no-op harmlessly (zero range).
+                    val g0 = try { cam.getGain() } catch (e: Exception) { null }
+                    if (g0 != null) {
+                        try { cam.setGain(g0) } catch (_: Exception) {}
+                        val g1 = try { cam.getGain() } catch (e: Exception) { null }
+                        writeLog("Gain freeze: $g0 -> $g1 (rewrote as manual)")
+                    } else {
+                        writeLog("Gain freeze: no gain control")
+                    }
+                }
+
                 // Log storage location
                 if (isUsingRemovableStorage()) {
                     writeLog("Storage: USB removable drive detected")

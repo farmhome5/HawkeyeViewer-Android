@@ -423,7 +423,19 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 	{
 		static int s_recv = 0, s_dropSize = 0, s_dropDim = 0, s_pass = 0;
 		s_recv++;
-		const bool badSize = (frame->frame_format != UVC_FRAME_FORMAT_MJPEG) && (frame->actual_bytes < preview->frameBytes);
+		// != not <: an OVERSIZED buffer is a merged pair of frames (a missed
+		// frame boundary in the stream layer) - displaying its first frameBytes
+		// shows the top of one frame and the bottom of another (the ENDO-CAM
+		// "flash"), and copying actual_bytes into a frameBytes pool buffer
+		// overruns the heap. Drop it: one skipped frame instead of a flash.
+		const bool badSize = (frame->frame_format != UVC_FRAME_FORMAT_MJPEG) && (frame->actual_bytes != preview->frameBytes);
+		if (badSize && (frame->actual_bytes > preview->frameBytes)) {
+			static int s_over = 0;
+			if ((++s_over <= 10) || ((s_over % 100) == 0))
+				LOGI("MERGEDIAG oversized frame #%d: %d bytes = frameBytes + %d (payloads ~%d)",
+					s_over, frame->actual_bytes, frame->actual_bytes - preview->frameBytes,
+					(frame->actual_bytes - preview->frameBytes + 36815) / 36816);
+		}
 		const bool badDim  = (frame->width != preview->frameWidth) || (frame->height != preview->frameHeight);
 		if (badSize) s_dropSize++;
 		if (badDim)  s_dropDim++;
@@ -436,7 +448,7 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 		}
 	}
 	if (UNLIKELY(
-		((frame->frame_format != UVC_FRAME_FORMAT_MJPEG) && (frame->actual_bytes < preview->frameBytes))
+		((frame->frame_format != UVC_FRAME_FORMAT_MJPEG) && (frame->actual_bytes != preview->frameBytes))
 		|| (frame->width != preview->frameWidth) || (frame->height != preview->frameHeight) )) {
 
 #if LOCAL_DEBUG
@@ -526,6 +538,25 @@ int UVCPreview::prepare_preview(uvc_stream_ctrl_t *ctrl) {
 		frame_format_for_mode(requestMode),
 		requestWidth, requestHeight, requestMinFps, requestMaxFps
 	);
+	if (!result && (requestMode == 2)) {
+		// UYVY cameras (ENDO-CAM) advertise a single 60 fps interval, but at
+		// 60 fps the sensor's AE dithers continuously and each step lands
+		// mid-readout as a half-bright "flash" frame (rolling shutter). The
+		// Windows viewer looks clean because Chromium runs the same camera at
+		// its default 30 fps. Ask for 30 via a probe: a camera that accepts
+		// returns 333333, one that refuses adjusts back and nothing changes.
+		uint32_t advertised = ctrl->dwFrameInterval;
+		ctrl->dwFrameInterval = 333333;	// 30 fps in 100 ns units
+		uvc_error_t r2 = uvc_probe_stream_ctrl(mDeviceHandle, ctrl);
+		LOGI("UYVY 30fps probe: advertised=%u requested=333333 result=%d negotiated=%u",
+			advertised, r2, ctrl->dwFrameInterval);
+		if (r2 < 0) {
+			// probe failed outright - renegotiate the original
+			result = uvc_get_stream_ctrl_format_size_fps(mDeviceHandle, ctrl,
+				frame_format_for_mode(requestMode),
+				requestWidth, requestHeight, requestMinFps, requestMaxFps);
+		}
+	}
 	if (LIKELY(!result)) {
 #if LOCAL_DEBUG
 		uvc_print_stream_ctrl(ctrl, stderr);

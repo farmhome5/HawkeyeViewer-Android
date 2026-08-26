@@ -432,6 +432,17 @@ class CameraUVC(ctx: Context, device: UsbDevice) : MultiCameraClient.ICamera(ctx
     }
 
     /**
+     * Anti-flicker (UVC power line frequency): 0 = off, 1 = 50 Hz, 2 = 60 Hz.
+     * A mis-set value makes some cameras' auto-exposure pulse (single-frame
+     * brightness pops), e.g. the ENDO-CAM's bare 60 fps sensor.
+     */
+    fun setPowerlineFrequency(freq: Int) {
+        mUvcCamera?.powerlineFrequency = freq
+    }
+
+    fun getPowerlineFrequency() = mUvcCamera?.powerlineFrequency
+
+    /**
      * Set brightness
      *
      * @param brightness brightness value, 0 means reset
