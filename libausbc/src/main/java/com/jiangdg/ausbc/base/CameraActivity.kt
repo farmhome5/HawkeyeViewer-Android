@@ -312,6 +312,11 @@ abstract class CameraActivity: BaseActivity(), ICameraStateCallBack {
         getCurrentCamera()?.setCropZoom(cropZoomX, cropZoomY)
     }
 
+    /** Mirror-tube circular mask, baked into preview, stills and recordings. */
+    protected fun setRenderMask(on: Boolean, r: Float) {
+        getCurrentCamera()?.setMask(on, r)
+    }
+
     /**
      * Update resolution
      *

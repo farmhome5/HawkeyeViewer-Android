@@ -552,6 +552,10 @@ class MultiCameraClient(ctx: Context, callback: IDeviceConnectCallBack?) {
             mRenderManager?.setZoomPan(zoom, panX, panY)
         }
 
+        fun setMask(on: Boolean, r: Float) {
+            mRenderManager?.setMask(on, r)
+        }
+
         fun setCropZoom(cropZoomX: Float, cropZoomY: Float) {
             mRenderManager?.setCropZoom(cropZoomX, cropZoomY)
         }

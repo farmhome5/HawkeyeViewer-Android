@@ -258,6 +258,9 @@ class MainActivity : CameraActivity() {
                 // Re-apply crop zoom for current aspect ratio selection
                 setCropZoom(currentCropZoomX, currentCropZoomY)
 
+                // Re-apply the mirror-tube mask into the fresh GL pipeline
+                applyMask()
+
                 // Re-apply zoom/pan (needed after returning from gallery or resume)
                 applyZoomPan()
 
@@ -1160,14 +1163,18 @@ class MainActivity : CameraActivity() {
         val flip = binding.flipCheckBox.isChecked
         val needsColor = Math.abs(b - 1.0f) > 0.01f || Math.abs(c - 1.0f) > 0.01f ||
             Math.abs(s - 1.0f) > 0.01f || Math.abs(g - 1.0f) > 0.01f
-        // If all defaults and no transform, remove applier
-        if (!needsColor && !mirror && !flip) {
+        // If all defaults, no transform and no mask, remove applier.
+        // maskOn matters here: hardware-button stills come straight off the
+        // camera, bypassing the GL pipeline that bakes the mask everywhere
+        // else, so they get it painted file-side for WYSIWYG parity.
+        if (!needsColor && !mirror && !flip && !maskOn) {
             setImageAdjustmentApplier(null)
             return
         }
         setImageAdjustmentApplier(object : com.jiangdg.ausbc.MultiCameraClient.ICamera.ImageAdjustmentApplier {
             override fun applyToFile(path: String) {
                 applyStillAdjustments(path)
+                paintMaskOnFile(path)
             }
         })
     }
@@ -1379,6 +1386,12 @@ class MainActivity : CameraActivity() {
     private fun applyMask() {
         val container = binding.cameraContainer
         binding.mtmIndicator.visibility = if (maskOn) View.VISIBLE else View.GONE
+        // Bake the mask into the GL pipeline too (screen, stills AND recordings)
+        // so captures are WYSIWYG like the Windows app. The view clip below stays
+        // as well — same geometry, and it covers the container edges instantly.
+        if (isCameraOpened()) {
+            setRenderMask(maskOn, maskRadiusRef / MASK_REF_HEIGHT)
+        }
         if (!maskOn) {
             container.clipToOutline = false
             container.outlineProvider = ViewOutlineProvider.BACKGROUND
@@ -1444,6 +1457,7 @@ class MainActivity : CameraActivity() {
             setMirrorChecked(false)
         }
         applyMask()
+        updateCaptureAdjustmentApplier()
         syncMaskUi()
         saveMaskSettings()
         writeLog(
@@ -1837,6 +1851,44 @@ private fun triggerHardwareCapture(fromHardwareButton: Boolean) {
     }
 
     /** Apply current adjustments + mirror/flip to a saved JPEG file (WYSIWYG) */
+    /**
+     * Paints the mirror-tube mask onto a saved still. Only needed for images
+     * that bypass the GL pipeline (hardware-button captures straight off the
+     * camera); GL-derived stills and recordings get the mask from the shader.
+     * Same geometry as the shader/view clip: centred, radius as a fraction of
+     * the image's shorter side.
+     */
+    private fun paintMaskOnFile(path: String) {
+        if (!maskOn) return
+        try {
+            val file = java.io.File(path)
+            if (!file.exists()) return
+            val original = android.graphics.BitmapFactory.decodeFile(path) ?: return
+            val bitmap = if (original.isMutable) original
+                else original.copy(android.graphics.Bitmap.Config.ARGB_8888, true).also { original.recycle() }
+            val w = bitmap.width.toFloat()
+            val h = bitmap.height.toFloat()
+            val r = (maskRadiusRef / MASK_REF_HEIGHT) * minOf(w, h)
+            val ring = android.graphics.Path().apply {
+                fillType = android.graphics.Path.FillType.EVEN_ODD
+                addRect(0f, 0f, w, h, android.graphics.Path.Direction.CW)
+                addCircle(w / 2f, h / 2f, r, android.graphics.Path.Direction.CW)
+            }
+            android.graphics.Canvas(bitmap).drawPath(ring, android.graphics.Paint().apply {
+                color = android.graphics.Color.BLACK
+                style = android.graphics.Paint.Style.FILL
+                isAntiAlias = true
+            })
+            java.io.FileOutputStream(file).use { fos ->
+                bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 100, fos)
+            }
+            bitmap.recycle()
+            writeLog("paintMaskOnFile: mask baked into $path (r=${r.toInt()}px)")
+        } catch (e: Exception) {
+            writeLog("paintMaskOnFile: EXCEPTION - ${e.message}")
+        }
+    }
+
     private fun applyStillAdjustments(path: String) {
         val b = shaderBrightness
         val c = shaderContrast

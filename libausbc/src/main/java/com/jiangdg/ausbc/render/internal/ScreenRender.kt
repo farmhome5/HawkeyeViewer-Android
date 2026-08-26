@@ -35,6 +35,8 @@ class ScreenRender(context: Context) : AbstractRender(context) {
     private var mZoomHandle = -1
     private var mPanHandle = -1
     private var mCropZoomHandle = -1
+    private var mMaskOnHandle = -1
+    private var mMaskRHandle = -1
 
     // Current adjustment values (defaults = no change)
     @Volatile var brightness: Float = 1.0f
@@ -48,6 +50,8 @@ class ScreenRender(context: Context) : AbstractRender(context) {
     @Volatile var zoom: Float = 1.0f
     @Volatile var panX: Float = 0.0f
     @Volatile var panY: Float = 0.0f
+    @Volatile var maskOn: Float = 0.0f
+    @Volatile var maskR: Float = 0.39f
     @Volatile var cropZoomX: Float = 1.0f
     @Volatile var cropZoomY: Float = 1.0f
 
@@ -79,6 +83,8 @@ class ScreenRender(context: Context) : AbstractRender(context) {
         mZoomHandle = GLES20.glGetUniformLocation(mProgram, "uZoom")
         mPanHandle = GLES20.glGetUniformLocation(mProgram, "uPan")
         mCropZoomHandle = GLES20.glGetUniformLocation(mProgram, "uCropZoom")
+        mMaskOnHandle = GLES20.glGetUniformLocation(mProgram, "uMaskOn")
+        mMaskRHandle = GLES20.glGetUniformLocation(mProgram, "uMaskR")
     }
 
     override fun setSize(width: Int, height: Int) {
@@ -100,6 +106,8 @@ class ScreenRender(context: Context) : AbstractRender(context) {
         if (mZoomHandle >= 0) GLES20.glUniform1f(mZoomHandle, zoom)
         if (mPanHandle >= 0) GLES20.glUniform2f(mPanHandle, panX, panY)
         if (mCropZoomHandle >= 0) GLES20.glUniform2f(mCropZoomHandle, cropZoomX, cropZoomY)
+        if (mMaskOnHandle >= 0) GLES20.glUniform1f(mMaskOnHandle, maskOn)
+        if (mMaskRHandle >= 0) GLES20.glUniform1f(mMaskRHandle, maskR)
     }
 
     override fun clear() {

@@ -270,6 +270,20 @@ class RenderManager(
                     }
                 }
             }
+            MSG_GL_SET_MASK -> {
+                (msg.obj as? FloatArray)?.let { values ->
+                    if (values.size >= 2) {
+                        mScreenRender?.maskOn = values[0]
+                        mScreenRender?.maskR = values[1]
+
+                        mCaptureRender?.maskOn = values[0]
+                        mCaptureRender?.maskR = values[1]
+
+                        mEncodeRender?.maskOn = values[0]
+                        mEncodeRender?.maskR = values[1]
+                    }
+                }
+            }
             MSG_GL_RELEASE -> {
                 EventBus.with<Boolean>(BusKey.KEY_RENDER_READY).postMessage(false)
                 mEffectList.forEach { effect ->
@@ -449,6 +463,18 @@ class RenderManager(
     fun setCropZoom(cropZoomX: Float, cropZoomY: Float) {
         val values = floatArrayOf(cropZoomX, cropZoomY)
         mRenderHandler?.obtainMessage(MSG_GL_SET_CROP_ZOOM, values)?.sendToTarget()
+    }
+
+    /**
+     * Enable/disable the mirror-tube circular mask, baked into screen,
+     * capture and encode renders alike (WYSIWYG recordings).
+     *
+     * @param on mask enabled
+     * @param r  radius as a fraction of the visible image's shorter side
+     */
+    fun setMask(on: Boolean, r: Float) {
+        val values = floatArrayOf(if (on) 1.0f else 0.0f, r)
+        mRenderHandler?.obtainMessage(MSG_GL_SET_MASK, values)?.sendToTarget()
     }
 
     /**
@@ -726,6 +752,7 @@ class RenderManager(
         private const val MSG_GL_SET_ADJUSTMENTS = 0x0A
         private const val MSG_GL_SET_ZOOM_PAN = 0x0B
         private const val MSG_GL_SET_CROP_ZOOM = 0x0C
+        private const val MSG_GL_SET_MASK = 0x0D
 
         // codec
         private const val MSG_GL_RENDER_CODEC_INIT = 0x11

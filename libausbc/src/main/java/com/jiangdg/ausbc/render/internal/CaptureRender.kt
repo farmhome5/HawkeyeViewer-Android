@@ -38,6 +38,8 @@ class CaptureRender(context: Context) : AbstractFboRender(context) {
     private var mZoomHandle = -1
     private var mPanHandle = -1
     private var mCropZoomHandle = -1
+    private var mMaskOnHandle = -1
+    private var mMaskRHandle = -1
 
     @Volatile var brightness: Float = 1.0f
     @Volatile var contrast: Float = 1.0f
@@ -50,6 +52,8 @@ class CaptureRender(context: Context) : AbstractFboRender(context) {
     @Volatile var zoom: Float = 1.0f
     @Volatile var panX: Float = 0.0f
     @Volatile var panY: Float = 0.0f
+    @Volatile var maskOn: Float = 0.0f
+    @Volatile var maskR: Float = 0.39f
     @Volatile var cropZoomX: Float = 1.0f
     @Volatile var cropZoomY: Float = 1.0f
     private var loggedOnce = false
@@ -73,6 +77,8 @@ class CaptureRender(context: Context) : AbstractFboRender(context) {
         mZoomHandle = GLES20.glGetUniformLocation(mProgram, "uZoom")
         mPanHandle = GLES20.glGetUniformLocation(mProgram, "uPan")
         mCropZoomHandle = GLES20.glGetUniformLocation(mProgram, "uCropZoom")
+        mMaskOnHandle = GLES20.glGetUniformLocation(mProgram, "uMaskOn")
+        mMaskRHandle = GLES20.glGetUniformLocation(mProgram, "uMaskR")
         Log.i("CaptureRender", "init: program=$mProgram brightness=$mBrightnessHandle contrast=$mContrastHandle sat=$mSaturationHandle hue=$mHueHandle gamma=$mGammaHandle sharp=$mSharpnessHandle texel=$mTexelSizeHandle")
     }
 
@@ -97,6 +103,8 @@ class CaptureRender(context: Context) : AbstractFboRender(context) {
         if (mZoomHandle >= 0) GLES20.glUniform1f(mZoomHandle, zoom)
         if (mPanHandle >= 0) GLES20.glUniform2f(mPanHandle, panX, panY)
         if (mCropZoomHandle >= 0) GLES20.glUniform2f(mCropZoomHandle, cropZoomX, cropZoomY)
+        if (mMaskOnHandle >= 0) GLES20.glUniform1f(mMaskOnHandle, maskOn)
+        if (mMaskRHandle >= 0) GLES20.glUniform1f(mMaskRHandle, maskR)
 
         if (!loggedOnce && brightness != 1.0f) {
             Log.i("CaptureRender", "beforeDraw: b=$brightness c=$contrast s=$saturation h=$hue g=$gamma sh=$sharpness texel=${texelWidth}x${texelHeight}")
