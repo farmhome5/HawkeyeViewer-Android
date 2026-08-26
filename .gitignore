@@ -35,3 +35,4 @@ google-services.json
 node_modules/
 nul
 key.properties
+libausbc/libs/*.bak*

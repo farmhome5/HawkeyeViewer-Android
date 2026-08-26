@@ -1203,13 +1203,68 @@ uvc_error_t uvc_scan_streaming(uvc_device_t *dev, uvc_device_info_t *info,
 	if_desc = &(info->config->interface[interface_idx].altsetting[0]);
 	buffer = if_desc->extra;
 	buffer_left = if_desc->extra_length;
-	// XXX some device have it's format descriptions after the endpoint descriptor
+	// Sanity-check the interface extra before trusting it. The NOVATEK "HDUSB"
+	// borescope has been observed handing back a wild pointer with a garbage
+	// length (1852785440 — ASCII heap junk) right after a power cycle, and a
+	// useless 6-byte stub on the next attempt; walking either crashes. A real
+	// UVC VS block list starts with a CS_INTERFACE (0x24) VS_INPUT_HEADER and
+	// is at least 13 bytes. Anything implausible is treated as absent so the
+	// endpoint-extra fallback below gets its chance instead of a SIGSEGV.
+	if (buffer_left && (!buffer || buffer_left > 0x4000 || buffer_left < 13 || buffer[1] != 0x24)) {
+		LOGW("uvc_scan_streaming: interface %d extra data implausible (len=%d first-type=0x%02x), ignoring it",
+			interface_idx, (int) buffer_left,
+			(buffer && buffer_left >= 2 && buffer_left <= 0x4000) ? buffer[1] : 0);
+		buffer = NULL;
+		buffer_left = 0;
+	}
+	// XXX some devices (e.g. NOVATEK "HDUSB" borescope, VID 0x2622 PID 0xAB01) place
+	// their class-specific VS blocks AFTER the endpoint descriptor. libusb's
+	// parse_endpoint collects those trailing blocks into endpoint->extra, so fall
+	// back to scanning the extras of ALL endpoints of this interface, not just
+	// endpoint[0], and log which source was actually used.
 	if (UNLIKELY(!buffer || !buffer_left)) {
-		if (if_desc->bNumEndpoints && if_desc->endpoint) {
-			// try to use extra data in endpoint[0]
-			buffer = if_desc->endpoint[0].extra;
-			buffer_left = if_desc->endpoint[0].extra_length;
+		// altsetting[0] came up empty. Some layouts (zero-bandwidth alt0) only
+		// carry endpoints — and the class-specific blocks libusb attaches to
+		// them — on higher altsettings, so scan every altsetting's interface
+		// extra and every endpoint's extra for the first plausible VS block
+		// list (CS_INTERFACE 0x24, >= 13 bytes). Log the whole topology so a
+		// failing camera's layout is readable straight from logcat.
+		const struct libusb_interface *intf = &(info->config->interface[interface_idx]);
+		int alt_ix, ep_ix;
+		for (alt_ix = 0; alt_ix < intf->num_altsetting; alt_ix++) {
+			const struct libusb_interface_descriptor *alt = &intf->altsetting[alt_ix];
+			LOGW("uvc_scan_streaming: interface %d alt %d: %d endpoints, interface extra %d bytes",
+				interface_idx, alt_ix, alt->bNumEndpoints, alt->extra_length);
+			if (!buffer_left && alt->extra && (alt->extra_length >= 13)
+					&& (alt->extra_length <= 0x4000) && (alt->extra[1] == 0x24)) {
+				buffer = alt->extra;
+				buffer_left = alt->extra_length;
+				LOGW("uvc_scan_streaming: using %d bytes from interface %d alt %d interface extra",
+					(int) buffer_left, interface_idx, alt_ix);
+			}
+			if (alt->endpoint) {
+				for (ep_ix = 0; ep_ix < alt->bNumEndpoints; ep_ix++) {
+					const struct libusb_endpoint_descriptor *ep = &alt->endpoint[ep_ix];
+					LOGW("uvc_scan_streaming: interface %d alt %d endpoint[%d] (0x%02x): extra %d bytes, first-type 0x%02x",
+						interface_idx, alt_ix, ep_ix, ep->bEndpointAddress, ep->extra_length,
+						(ep->extra && ep->extra_length >= 2 && ep->extra_length <= 0x4000) ? ep->extra[1] : 0);
+					if (!buffer_left && ep->extra && (ep->extra_length >= 13)
+							&& (ep->extra_length <= 0x4000) && (ep->extra[1] == 0x24)) {
+						buffer = ep->extra;
+						buffer_left = ep->extra_length;
+						LOGW("uvc_scan_streaming: using %d bytes of class-specific data from interface %d alt %d endpoint[%d] (0x%02x)",
+							(int) buffer_left, interface_idx, alt_ix, ep_ix, ep->bEndpointAddress);
+					}
+				}
+			}
 		}
+		if (UNLIKELY(!buffer || !buffer_left)) {
+			LOGW("uvc_scan_streaming: interface %d: no plausible class-specific data in any of %d altsettings",
+				interface_idx, intf->num_altsetting);
+		}
+	} else {
+		LOGW("uvc_scan_streaming: interface %d using %d bytes of interface extra data (standard descriptor ordering)",
+			interface_idx, (int) buffer_left);
 	}
 	stream_if = calloc(1, sizeof(*stream_if));
 	stream_if->parent = info;
@@ -1219,6 +1274,12 @@ uvc_error_t uvc_scan_streaming(uvc_device_t *dev, uvc_device_info_t *info,
 	if (LIKELY(buffer_left >= 3)) {
 		while (buffer_left >= 3) {
 			block_size = buffer[0];
+			// A zero-length block would loop forever and an oversized one would
+			// walk past the descriptor blob; both mean corrupt data — stop.
+			if (block_size < 3 || block_size > buffer_left) {
+				LOGW("uvc_scan_streaming: corrupt VS block (size=%d, %d bytes left), stopping parse", (int) block_size, (int) buffer_left);
+				break;
+			}
 //			MARK("bDescriptorType=0x%02x", buffer[1]);
 			parse_ret = uvc_parse_vs(dev, info, stream_if, buffer, block_size);
 

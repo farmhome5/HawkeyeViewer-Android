@@ -602,8 +602,18 @@ static int parse_configuration(struct libusb_context *ctx,
 			}
 
 			MARK("bDescriptorType=0x%02x", header.bDescriptorType);
-			/* If we find another "proper" descriptor then we're done */
-			if (is_known_descriptor_type(header.bDescriptorType))
+			/* If we find another "proper" descriptor then we're done.
+			 * EXCEPTION: an ENDPOINT descriptor is never legitimate here at
+			 * config level (endpoints belong inside parse_interface). Some
+			 * nonconformant devices (NOVATEK "HDUSB" borescope, 2622:AB01)
+			 * emit an orphan endpoint beyond an interface's declared
+			 * bNumEndpoints; without this exception it falls through the
+			 * switch below into parse_interface, which rejects it and
+			 * returns 0 — silently dropping every remaining interface
+			 * (the video streaming interface ends up with 0 altsettings).
+			 * Skip it like any other unknown descriptor instead. */
+			if (is_known_descriptor_type(header.bDescriptorType)
+					&& (header.bDescriptorType != LIBUSB_DT_ENDPOINT))
 				break;
 
 			usbi_dbg("skipping descriptor 0x%02x\n", header.bDescriptorType);
