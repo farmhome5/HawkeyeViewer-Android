@@ -740,8 +740,24 @@ class MainActivity : CameraActivity() {
         // user could drag the visible circle completely off the display.
         // Window-inside-crop condition: |pan| <= (zoom-1) / (2 * crop * zoom).
         // With crop = 1 (HVR square sensors) this is exactly the old bound.
-        val maxPanX = if (currentZoom > 1f) (currentZoom - 1f) / (2f * totalZoomX) else 0f
-        val maxPanY = if (currentZoom > 1f) (currentZoom - 1f) / (2f * totalZoomY) else 0f
+        var maxPanX = if (currentZoom > 1f) (currentZoom - 1f) / (2f * totalZoomX) else 0f
+        var maxPanY = if (currentZoom > 1f) (currentZoom - 1f) / (2f * totalZoomY) else 0f
+        // With the mask on, the frame bound is not enough: a small mask circle
+        // at high zoom can wander clear off the display while the frame still
+        // covers the view. Additionally require the circle to always cover the
+        // view centre — any rim point can be brought to centre screen (full
+        // inspection of the disc) but the disc can never leave the display.
+        // Circle centre offset = pan*crop*zoom, radius = f*min(w,h)/axis*zoom:
+        // zoom cancels, giving |pan| <= f*min(w,h) / (axis * crop).
+        if (maskOn) {
+            val w = binding.cameraContainer.width.toFloat()
+            val h = binding.cameraContainer.height.toFloat()
+            if (w > 0f && h > 0f) {
+                val rMin = (maskRadiusRef / MASK_REF_HEIGHT) * minOf(w, h)
+                maxPanX = minOf(maxPanX, rMin / (w * currentCropZoomX))
+                maxPanY = minOf(maxPanY, rMin / (h * currentCropZoomY))
+            }
+        }
         currentPanX = currentPanX.coerceIn(-maxPanX, maxPanX)
         currentPanY = currentPanY.coerceIn(-maxPanY, maxPanY)
     }
@@ -1501,6 +1517,10 @@ class MainActivity : CameraActivity() {
         maskRadiusRef = value.coerceIn(MASK_RADIUS_MIN, MASK_RADIUS_MAX)
         applyMask()
         syncMaskUi()
+        // Shrinking the circle tightens the mask-aware pan bound; re-clamp so a
+        // panned view cannot be left stranded outside the new circle.
+        clampPan()
+        applyZoomPan()
     }
 
     /** Pushes mask state into both UI copies without re-entering listeners. */
