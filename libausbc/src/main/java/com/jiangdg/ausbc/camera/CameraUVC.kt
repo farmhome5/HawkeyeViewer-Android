@@ -148,6 +148,9 @@ class CameraUVC(ctx: Context, device: UsbDevice) : MultiCameraClient.ICamera(ctx
                 return
             }
             initEncodeProcessor(previewSize.width, previewSize.height)
+            // DIAGNOSTIC: dump full format/fps descriptor JSON before negotiation
+            Logger.i(TAG, "UVC supportedSize JSON: ${mUvcCamera?.supportedSize}")
+            Logger.i(TAG, "UVC negotiation: ${previewSize.width}x${previewSize.height} fps[$MIN_FS,$MAX_FPS] MJPEG bw=${UVCCamera.DEFAULT_BANDWIDTH}")
             // if give custom minFps or maxFps or unsupported preview size
             // this method will fail
             mUvcCamera?.setPreviewSize(
@@ -180,10 +183,26 @@ class CameraUVC(ctx: Context, device: UsbDevice) : MultiCameraClient.ICamera(ctx
                     UVCCamera.DEFAULT_BANDWIDTH
                 )
             } catch (e: Exception) {
-                closeCamera()
-                postStateEvent(ICameraStateCallBack.State.ERROR, "err: ${e.localizedMessage}")
-                Logger.e(TAG, " setPreviewSize failed, even using yuv format", e)
-                return
+                try {
+                    // UYVY fallback (mode 2). Cameras like the ENDO-CAM advertise a single
+                    // UYVY uncompressed format (no MJPEG, and YUYV won't match). libuvc
+                    // supports UYVY; mode 2 is wired into the native UVCPreview mode→format
+                    // map. UVCCamera (AAR) has no named constant, so pass the literal 2.
+                    Logger.e(TAG, " setPreviewSize failed with YUYV, try UYVY format...")
+                    mUvcCamera?.setPreviewSize(
+                        previewSize.width,
+                        previewSize.height,
+                        MIN_FS,
+                        MAX_FPS,
+                        2, // FRAME_FORMAT_UYVY
+                        UVCCamera.DEFAULT_BANDWIDTH
+                    )
+                } catch (e2: Exception) {
+                    closeCamera()
+                    postStateEvent(ICameraStateCallBack.State.ERROR, "err: ${e2.localizedMessage}")
+                    Logger.e(TAG, " setPreviewSize failed, even using uyvy format", e2)
+                    return
+                }
             }
         }
         // if not opengl render or opengl render with preview callback

@@ -606,8 +606,17 @@ uvc_error_t uvc_probe_stream_ctrl(uvc_device_handle_t *devh,
 static void _uvc_swap_buffers(uvc_stream_handle_t *strmh) {
 	uint8_t *tmp_buf;
 
-	pthread_mutex_lock(&strmh->cb_mutex);
-	{
+	// Publish the completed frame WITHOUT blocking the USB event thread.
+	// This runs on the libusb transfer-callback (event) thread. The consumer
+	// (_uvc_user_caller) holds cb_mutex while it does a per-frame ~4MB copy in
+	// _uvc_populate_frame. With only two buffers, a blocking lock here stalls the
+	// event thread ~1-2ms every frame -> the bulk IN pipe isn't drained -> the
+	// camera's FIFO backs up -> timing-sensitive bulk cameras (ENDO-CAM) stop
+	// streaming after a few frames. So we trylock: if the consumer is still busy,
+	// DROP this frame (just reset for the next) and keep the pipe continuously
+	// drained, mirroring how a kernel UVC driver behaves. A dropped frame only
+	// lowers framerate; it never freezes the stream.
+	if (pthread_mutex_trylock(&strmh->cb_mutex) == 0) {
 		/* swap the buffers */
 		tmp_buf = strmh->holdbuf;
 		strmh->hold_bfh_err = strmh->bfh_err;	// XXX
@@ -619,8 +628,13 @@ static void _uvc_swap_buffers(uvc_stream_handle_t *strmh) {
 		strmh->hold_seq = strmh->seq;
 
 		pthread_cond_broadcast(&strmh->cb_cond);
+		pthread_mutex_unlock(&strmh->cb_mutex);
+	} else {
+		// consumer still busy with the previous frame -> drop this one
+		static int s_dropped = 0;
+		if ((++s_dropped <= 3) || ((s_dropped % 100) == 0))
+			LOGI("SWAPDIAG: consumer busy, dropped frame #%d (event thread NOT stalled)", s_dropped);
 	}
-	pthread_mutex_unlock(&strmh->cb_mutex);
 
 	strmh->seq++;
 	strmh->got_bytes = 0;
@@ -728,12 +742,18 @@ static void _uvc_process_payload(uvc_stream_handle_t *strmh, const uint8_t *payl
 		header_info = payload[1];
 
 		if (UNLIKELY(header_info & UVC_STREAM_ERR)) {
-//			strmh->bfh_err |= UVC_STREAM_ERR;
-			UVC_DEBUG("bad packet: error bit set");
-			libusb_clear_halt(strmh->devh->usb_devh, strmh->stream_if->bEndpointAddress);
-//			uvc_vc_get_error_code(strmh->devh, &vc_error_code, UVC_GET_CUR);
-			uvc_vs_get_error_code(strmh->devh, &vs_error_code, UVC_GET_CUR);
-//			return;
+			// Flag this frame as broken so it is dropped at delivery
+			// (_uvc_user_caller skips populate/user_cb when hold_bfh_err is set,
+			// and _uvc_swap_buffers resets the flag for the next frame).
+			//
+			// Do NOT call libusb_clear_halt() or uvc_vs_get_error_code() here:
+			// both issue SYNCHRONOUS control transfers from inside the libusb
+			// bulk transfer callback. On bulk-mode cameras (e.g. ENDO-CAM) the
+			// first error-bit frame then wedges the whole stream — it delivers a
+			// few frames and stalls. Just marking the frame bad and continuing
+			// lets streaming recover, matching ShenYao's "drop broken frames".
+			strmh->bfh_err |= UVC_STREAM_ERR;
+			{ static int s_err = 0; if ((++s_err <= 3) || ((s_err % 100) == 0)) LOGI("BULKDIAG: error-bit frames dropped=%d (continuing)", s_err); }
 		}
 
 		if ((strmh->fid != (header_info & UVC_STREAM_FID)) && strmh->got_bytes) {
@@ -767,6 +787,21 @@ static void _uvc_process_payload(uvc_stream_handle_t *strmh, const uint8_t *payl
 				strmh->last_scr = 0;
 			}
 		}
+	}
+
+	// DIAGNOSTIC: inspect payload headers to learn why frames don't complete
+	// (is the EOF bit ever set? does the FID bit ever toggle?)
+	{
+		static int s_p = 0, s_eof = 0, s_fidtog = 0, s_lastfid = -1;
+		++s_p;
+		const int fid = header_info & UVC_STREAM_FID;
+		const int eof = (header_info & UVC_STREAM_EOF) ? 1 : 0;
+		if (eof) s_eof++;
+		if (s_lastfid >= 0 && fid != s_lastfid) s_fidtog++;
+		s_lastfid = fid;
+		if ((s_p <= 20) || ((s_p % 2000) == 0))
+			LOGI("HDRDIAG p=%d hlen=%zu hinfo=0x%02x fid=%d eof=%d got=%zu | eofTot=%d fidTog=%d",
+				s_p, header_len, (unsigned)header_info, fid, eof, (size_t)strmh->got_bytes, s_eof, s_fidtog);
 	}
 
 	if (LIKELY(data_len > 0)) {
@@ -1003,9 +1038,16 @@ static void _uvc_stream_callback(struct libusb_transfer *transfer) {
 		break;
 	}
 
+	{ static int s_cb = 0; ++s_cb;
+		if ((s_cb <= 15) || ((s_cb % 60) == 0) || (transfer->status != LIBUSB_TRANSFER_COMPLETED) || !resubmit)
+			LOGI("XFERDIAG cb=%d status=%d actual=%d/%d running=%d resubmit=%d",
+				s_cb, transfer->status, transfer->actual_length, transfer->length, strmh->running, resubmit);
+	}
 	if (LIKELY(strmh->running && resubmit)) {
-		libusb_submit_transfer(transfer);
+		int rs = libusb_submit_transfer(transfer);
+		if (UNLIKELY(rs != 0)) LOGI("XFERDIAG resubmit FAILED rs=%d", rs);
 	} else {
+		LOGI("XFERDIAG transfer STOPPED (running=%d resubmit=%d status=%d)", strmh->running, resubmit, transfer->status);
 		// XXX delete non-reusing transfer
 		// real implementation of deleting transfer moves to _uvc_delete_transfer
 		_uvc_delete_transfer(transfer);

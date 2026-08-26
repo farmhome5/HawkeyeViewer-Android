@@ -176,6 +176,18 @@ void UVCPreview::clear_pool() {
 
 inline const bool UVCPreview::isRunning() const {return mIsRunning; }
 
+// Map the Java-side "mode" int to a libuvc frame format.
+// 0 = YUYV (raw 4:2:2), 1 = MJPEG (compressed), 2 = UYVY (raw 4:2:2, byte-swapped).
+// UYVY and YUYV are both raw 2-bytes/pixel and go through the same (non-MJPEG)
+// preview path; uvc_any2rgbx auto-dispatches on the frame's tagged format.
+static inline enum uvc_frame_format frame_format_for_mode(int mode) {
+	switch (mode) {
+	case 1:  return UVC_FRAME_FORMAT_MJPEG;
+	case 2:  return UVC_FRAME_FORMAT_UYVY;
+	default: return UVC_FRAME_FORMAT_YUYV;
+	}
+}
+
 int UVCPreview::setPreviewSize(int width, int height, int min_fps, int max_fps, int mode, float bandwidth) {
 	ENTER();
 	
@@ -190,7 +202,7 @@ int UVCPreview::setPreviewSize(int width, int height, int min_fps, int max_fps, 
 
 		uvc_stream_ctrl_t ctrl;
 		result = uvc_get_stream_ctrl_format_size_fps(mDeviceHandle, &ctrl,
-			!requestMode ? UVC_FRAME_FORMAT_YUYV : UVC_FRAME_FORMAT_MJPEG,
+			frame_format_for_mode(requestMode),
 			requestWidth, requestHeight, requestMinFps, requestMaxFps);
 	}
 	
@@ -406,6 +418,23 @@ int UVCPreview::stopPreview() {
 void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args) {
 	UVCPreview *preview = reinterpret_cast<UVCPreview *>(vptr_args);
 	if UNLIKELY(!preview->isRunning() || !frame || !frame->frame_format || !frame->data || !frame->data_bytes) return;
+	// DIAGNOSTIC (UYVY single-frame freeze): count received frames and drop reasons.
+	// Tells us whether frames keep arriving (and get dropped) vs. streaming stalls.
+	{
+		static int s_recv = 0, s_dropSize = 0, s_dropDim = 0, s_pass = 0;
+		s_recv++;
+		const bool badSize = (frame->frame_format != UVC_FRAME_FORMAT_MJPEG) && (frame->actual_bytes < preview->frameBytes);
+		const bool badDim  = (frame->width != preview->frameWidth) || (frame->height != preview->frameHeight);
+		if (badSize) s_dropSize++;
+		if (badDim)  s_dropDim++;
+		if (!badSize && !badDim) s_pass++;
+		if ((s_recv <= 5) || ((s_recv % 60) == 0)) {
+			LOGI("FRAMEDIAG recv=%d pass=%d dropSize=%d dropDim=%d | fmt=%d bytes=%d/%d dim=%dx%d/%dx%d",
+				s_recv, s_pass, s_dropSize, s_dropDim,
+				frame->frame_format, frame->actual_bytes, preview->frameBytes,
+				frame->width, frame->height, preview->frameWidth, preview->frameHeight);
+		}
+	}
 	if (UNLIKELY(
 		((frame->frame_format != UVC_FRAME_FORMAT_MJPEG) && (frame->actual_bytes < preview->frameBytes))
 		|| (frame->width != preview->frameWidth) || (frame->height != preview->frameHeight) )) {
@@ -494,7 +523,7 @@ int UVCPreview::prepare_preview(uvc_stream_ctrl_t *ctrl) {
 
 	ENTER();
 	result = uvc_get_stream_ctrl_format_size_fps(mDeviceHandle, ctrl,
-		!requestMode ? UVC_FRAME_FORMAT_YUYV : UVC_FRAME_FORMAT_MJPEG,
+		frame_format_for_mode(requestMode),
 		requestWidth, requestHeight, requestMinFps, requestMaxFps
 	);
 	if (LIKELY(!result)) {
@@ -506,7 +535,7 @@ int UVCPreview::prepare_preview(uvc_stream_ctrl_t *ctrl) {
 		if (LIKELY(!result)) {
 			frameWidth = frame_desc->wWidth;
 			frameHeight = frame_desc->wHeight;
-			LOGI("frameSize=(%d,%d)@%s", frameWidth, frameHeight, (!requestMode ? "YUYV" : "MJPEG"));
+			LOGI("frameSize=(%d,%d)@%s", frameWidth, frameHeight, (requestMode == 1 ? "MJPEG" : (requestMode == 2 ? "UYVY" : "YUYV")));
 			pthread_mutex_lock(&preview_mutex);
 			if (LIKELY(mPreviewWindow)) {
 				ANativeWindow_setBuffersGeometry(mPreviewWindow,
@@ -518,7 +547,7 @@ int UVCPreview::prepare_preview(uvc_stream_ctrl_t *ctrl) {
 			frameHeight = requestHeight;
 		}
 		frameMode = requestMode;
-		frameBytes = frameWidth * frameHeight * (!requestMode ? 2 : 4);
+		frameBytes = frameWidth * frameHeight * (requestMode == 1 ? 4 : 2);  // MJPEG buffer 4bpp; YUYV/UYVY raw 2bpp
 		previewBytes = frameWidth * frameHeight * PREVIEW_PIXEL_BYTES;
 	} else {
 		LOGE("could not negotiate with camera:err=%d", result);
@@ -545,8 +574,8 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 #if LOCAL_DEBUG
 		LOGI("Streaming...");
 #endif
-		if (frameMode) {
-			// MJPEG mode
+		if (frameMode == 1) {
+			// MJPEG mode (mode 1); modes 0/2 (YUYV/UYVY) use the raw path below
 			for ( ; LIKELY(isRunning()) ; ) {
 				frame_mjpeg = waitPreviewFrame();
 				if (LIKELY(frame_mjpeg)) {
@@ -562,12 +591,14 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 				}
 			}
 		} else {
-			// yuvyv mode
+			// yuvyv mode (also UYVY mode 2)
+			int s_drawn = 0;  // DIAGNOSTIC: count frames actually drawn to the preview window
 			for ( ; LIKELY(isRunning()) ; ) {
 				frame = waitPreviewFrame();
 				if (LIKELY(frame)) {
 					frame = draw_preview_one(frame, &mPreviewWindow, uvc_any2rgbx, 4);
 					addCaptureFrame(frame);
+					if ((++s_drawn <= 5) || ((s_drawn % 60) == 0)) LOGI("DRAWDIAG drawn=%d", s_drawn);
 				}
 			}
 		}

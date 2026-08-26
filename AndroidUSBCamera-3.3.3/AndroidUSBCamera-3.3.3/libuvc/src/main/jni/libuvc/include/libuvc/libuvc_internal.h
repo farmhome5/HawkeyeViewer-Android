@@ -247,7 +247,9 @@ typedef struct uvc_device_info {
   We could/should change this to allow reduce it to, say, 5 by default
   and then allow the user to change the number of buffers as required.
  */
-#define LIBUVC_NUM_TRANSFER_BUFS 10
+#define LIBUVC_NUM_TRANSFER_BUFS 10	// baseline. Tuning this (3/10/64) does NOT fix the
+// ENDO-CAM bulk stall: it stops after ~8 frames regardless (64 made it worse, 3 added
+// tearing). Root cause is camera-side; needs the Windows USB capture to crack.
 
 #define LIBUVC_XFER_BUF_SIZE	( 16 * 1024 * 1024 )
 
