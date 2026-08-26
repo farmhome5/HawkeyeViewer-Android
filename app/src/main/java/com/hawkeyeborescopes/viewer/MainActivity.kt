@@ -1423,8 +1423,14 @@ class MainActivity : CameraActivity() {
                 // GL texture y runs bottom-up while view y runs top-down.
                 val baseR = min(w, h) * (maskRadiusRef / MASK_REF_HEIGHT)
                 val r = (baseR * currentZoom).toInt().coerceAtLeast(1)
-                val cx = (w / 2f + currentPanX * currentZoom * w).toInt()
-                val cy = (h / 2f - currentPanY * currentZoom * h).toInt()
+                // The renderer displaces the image by pan * cropZoom * zoom
+                // (base_vertex.glsl: totalZoom = uCropZoom * uZoom), so the clip
+                // circle must move by the same amount or it drifts off the GL
+                // shader mask on cameras with an asymmetric crop (LTC 1280x720
+                // at 1:1 view, cropX=1.78) — seen as a crescent "moon" when
+                // panned. Square-sensor HVRs have crop 1.0 and never showed it.
+                val cx = (w / 2f + currentPanX * currentCropZoomX * currentZoom * w).toInt()
+                val cy = (h / 2f - currentPanY * currentCropZoomY * currentZoom * h).toInt()
                 outline.setOval(cx - r, cy - r, cx + r, cy + r)
             }
         }
