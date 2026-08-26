@@ -727,13 +727,21 @@ class MainActivity : CameraActivity() {
         // Total zoom per axis = cropZoom * userZoom
         val totalZoomX = currentCropZoomX * currentZoom
         val totalZoomY = currentCropZoomY * currentZoom
-        if (totalZoomX <= 1.001f && totalZoomY <= 1.001f) {
+        if (currentZoom <= 1.001f) {
             currentPanX = 0f
             currentPanY = 0f
             return
         }
-        val maxPanX = if (totalZoomX > 1f) (totalZoomX - 1f) / (2f * totalZoomX) else 0f
-        val maxPanY = if (totalZoomY > 1f) (totalZoomY - 1f) / (2f * totalZoomY) else 0f
+        // Pan is limited to the aspect-CROPPED frame (the window the user sees
+        // at 1x), not the full sensor frame — same rule as the Windows viewer,
+        // which crops first and pans within the crop. The old bound
+        // (totalZoom-1)/(2*totalZoom) spanned the whole sensor, so on cameras
+        // whose frame is wider than the crop window (LTC 1280x720 at 1:1) the
+        // user could drag the visible circle completely off the display.
+        // Window-inside-crop condition: |pan| <= (zoom-1) / (2 * crop * zoom).
+        // With crop = 1 (HVR square sensors) this is exactly the old bound.
+        val maxPanX = if (currentZoom > 1f) (currentZoom - 1f) / (2f * totalZoomX) else 0f
+        val maxPanY = if (currentZoom > 1f) (currentZoom - 1f) / (2f * totalZoomY) else 0f
         currentPanX = currentPanX.coerceIn(-maxPanX, maxPanX)
         currentPanY = currentPanY.coerceIn(-maxPanY, maxPanY)
     }
