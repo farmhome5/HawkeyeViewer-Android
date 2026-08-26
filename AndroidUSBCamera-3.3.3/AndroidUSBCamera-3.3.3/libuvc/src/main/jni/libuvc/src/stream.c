@@ -1836,7 +1836,12 @@ uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
 			}
 		}
 
-		/* Wait for transfers to complete/cancel */
+		/* Wait for transfers to complete/cancel. Give the event thread a real
+		 * chance to reap the cancellations: giving up after a single timeout
+		 * used to let uvc_stream_close() destroy cb_mutex while a cancellation
+		 * callback was still queued -> FORTIFY abort in _uvc_delete_transfer
+		 * (pthread_mutex_lock on a destroyed mutex). */
+		int stop_timeouts = 0;
 		for (; 1 ;) {
 			for (i = 0; i < LIBUVC_NUM_TRANSFER_BUFS; i++) {
 				if (strmh->transfers[i] != NULL)
@@ -1858,7 +1863,11 @@ uvc_error_t uvc_stream_stop(uvc_stream_handle_t *strmh) {
              ts.tv_sec += 1;
              ts.tv_nsec += 0;
 			if (pthread_cond_timedwait(&strmh->cb_cond, &strmh->cb_mutex, &ts) == ETIMEDOUT) {
-                break;
+				if (++stop_timeouts >= 5) {
+					LOGW("uvc_stream_stop: %d transfer(s) still pending after %d s; giving up the wait",
+						LIBUVC_NUM_TRANSFER_BUFS - i, stop_timeouts);
+					break;
+				}
 			}
 		}
 		// Kick the user thread awake
@@ -1892,6 +1901,22 @@ void uvc_stream_close(uvc_stream_handle_t *strmh) {
 		uvc_stream_stop(strmh);
 
 	uvc_release_if(strmh->devh, strmh->stream_if->bInterfaceNumber);
+
+	{
+		/* If any transfer is still pending after stop's wait, its cancellation
+		 * callback (_uvc_delete_transfer) will still lock cb_mutex and touch
+		 * this handle. Destroying/freeing now is a crash (seen in the field as
+		 * a FORTIFY abort); deliberately leaking one stream handle is the
+		 * lesser evil. */
+		int pending;
+		for (pending = 0; pending < LIBUVC_NUM_TRANSFER_BUFS; pending++) {
+			if (strmh->transfers[pending] != NULL) {
+				LOGW("uvc_stream_close: transfer %d still pending - leaking stream handle instead of crashing", pending);
+				DL_DELETE(strmh->devh->streams, strmh);
+				UVC_EXIT_VOID();
+			}
+		}
+	}
 
 	if (strmh->frame.data) {
 		free(strmh->frame.data);
