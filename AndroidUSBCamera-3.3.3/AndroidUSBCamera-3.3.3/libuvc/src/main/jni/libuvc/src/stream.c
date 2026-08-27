@@ -1013,8 +1013,32 @@ static void _uvc_stream_callback(struct libusb_transfer *transfer) {
 	switch (transfer->status) {
 	case LIBUSB_TRANSFER_COMPLETED:
 		if (!transfer->num_iso_packets) {
-			/* This is a bulk mode transfer, so it just has one payload transfer */
-			_uvc_process_payload(strmh, transfer->buffer, transfer->actual_length);
+			if (strmh->bulk_chunked) {
+				/* Chunked bulk (16KB single-URB transfers): a payload spans
+				 * transfers and ends at the first SHORT transfer. Stage chunks,
+				 * then hand the reassembled payload to the parser in one piece.
+				 * bulk_chunk_got == (size_t)-1 means resyncing after a timeout
+				 * or overflow: discard chunks until a payload boundary. */
+				const int short_xfer = (transfer->actual_length < transfer->length);
+				if (strmh->bulk_chunk_got == (size_t)-1) {
+					if (short_xfer) strmh->bulk_chunk_got = 0;
+				} else if (strmh->bulk_chunk_got + (size_t)transfer->actual_length > strmh->bulk_chunk_size) {
+					LOGI("BULKDIAG: chunked payload overflow (%zu+%d>%zu) — resyncing",
+						strmh->bulk_chunk_got, transfer->actual_length, strmh->bulk_chunk_size);
+					strmh->bulk_chunk_got = short_xfer ? 0 : (size_t)-1;
+				} else {
+					memcpy(strmh->bulk_chunk_buf + strmh->bulk_chunk_got,
+						transfer->buffer, transfer->actual_length);
+					strmh->bulk_chunk_got += transfer->actual_length;
+					if (short_xfer) {
+						_uvc_process_payload(strmh, strmh->bulk_chunk_buf, strmh->bulk_chunk_got);
+						strmh->bulk_chunk_got = 0;
+					}
+				}
+			} else {
+				/* This is a bulk mode transfer, so it just has one payload transfer */
+				_uvc_process_payload(strmh, transfer->buffer, transfer->actual_length);
+			}
 		} else {
 			/* This is an isochronous mode transfer, so each packet has a payload transfer */
 			_uvc_process_payload_iso(strmh, transfer);
@@ -1033,6 +1057,11 @@ static void _uvc_stream_callback(struct libusb_transfer *transfer) {
 	case LIBUSB_TRANSFER_TIMED_OUT:
 	case LIBUSB_TRANSFER_STALL:
 	case LIBUSB_TRANSFER_OVERFLOW:
+		if (strmh->bulk_chunked && ((transfer->actual_length > 0) || (strmh->bulk_chunk_got > 0))) {
+			/* Mid-payload data is stale after a 5s stall — drop it and skip
+			 * chunks until the next payload boundary so headers realign. */
+			strmh->bulk_chunk_got = (size_t)-1;
+		}
 		UVC_DEBUG("retrying transfer, status = %d", transfer->status);
 //		MARK("retrying transfer, status = %d", transfer->status);
 		break;
@@ -1608,15 +1637,41 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 		}
 	} else {
 		MARK("bulk transfer mode");
+		/* Compressed bulk streams advertise a worst-case dwMaxPayloadTransferSize
+		 * (LTC/NOVATEK: 460802) while real payloads are a tenth of that, so every
+		 * payload ends in a short packet. A transfer bigger than 16KB becomes a
+		 * chain of usbfs URBs, and on hosts without bulk scatter-gather the kernel
+		 * must unlink the rest of the chain at every short packet — Unisoc (MUSB)
+		 * tablets corrupt that unlink and the camera wedges mid-payload. Capping
+		 * at 16KB keeps every transfer a single URB; payload chunks are reassembled
+		 * in the callback. Uncompressed bulk (ENDO-CAM, ~250MB/s) keeps full-size
+		 * transfers — 16KB chunks would mean ~15k callbacks/s there.
+		 */
+		size_t bulk_xfer_size = strmh->cur_ctrl.dwMaxPayloadTransferSize;
+		strmh->bulk_chunked = 0;
+		strmh->bulk_chunk_got = 0;
+		if ((strmh->frame_format == UVC_FRAME_FORMAT_MJPEG) && (bulk_xfer_size > 16384)) {
+			if (strmh->bulk_chunk_buf) {	// restarted stream: size may differ
+				free(strmh->bulk_chunk_buf);
+				strmh->bulk_chunk_buf = NULL;
+			}
+			strmh->bulk_chunk_size = bulk_xfer_size;
+			strmh->bulk_chunk_buf = malloc(strmh->bulk_chunk_size);
+			if (strmh->bulk_chunk_buf) {
+				strmh->bulk_chunked = 1;
+				bulk_xfer_size = 16384;
+				LOGI("BULKDIAG: chunked bulk mode, transfer=16384 payload<=%zu", strmh->bulk_chunk_size);
+			}
+		}
 		/** prepare for bulk transfer */
 		for (transfer_id = 0; transfer_id < LIBUVC_NUM_TRANSFER_BUFS; ++transfer_id) {
 			transfer = libusb_alloc_transfer(0);
 			strmh->transfers[transfer_id] = transfer;
-			strmh->transfer_bufs[transfer_id] = malloc(strmh->cur_ctrl.dwMaxPayloadTransferSize);
+			strmh->transfer_bufs[transfer_id] = malloc(bulk_xfer_size);
 			libusb_fill_bulk_transfer(transfer, strmh->devh->usb_devh,
 				format_desc->parent->bEndpointAddress,
 				strmh->transfer_bufs[transfer_id],
-				strmh->cur_ctrl.dwMaxPayloadTransferSize, _uvc_stream_callback,
+				bulk_xfer_size, _uvc_stream_callback,
 				(void *)strmh, 5000);
 		}
 	}
@@ -2001,6 +2056,10 @@ void uvc_stream_close(uvc_stream_handle_t *strmh) {
 	if (strmh->holdbuf) {
 		free(strmh->holdbuf);
 		strmh->holdbuf = NULL;
+	}
+	if (strmh->bulk_chunk_buf) {
+		free(strmh->bulk_chunk_buf);
+		strmh->bulk_chunk_buf = NULL;
 	}
 
 	pthread_cond_destroy(&strmh->cb_cond);

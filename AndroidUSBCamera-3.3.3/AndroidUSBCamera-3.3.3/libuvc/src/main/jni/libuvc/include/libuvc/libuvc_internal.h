@@ -283,6 +283,17 @@ struct uvc_stream_handle {
   uint8_t *transfer_bufs[LIBUVC_NUM_TRANSFER_BUFS];
   struct uvc_frame frame;
   enum uvc_frame_format frame_format;
+  /* Chunked bulk mode (compressed bulk streams, e.g. NOVATEK "HDUSB"):
+   * transfers are capped at 16KB so each is a SINGLE usbfs URB. Larger
+   * transfers get split into chained URBs, and on host controllers without
+   * scatter-gather (Unisoc/MUSB tablets) the per-payload short-packet unlink
+   * of the remaining chain wedges the camera's firmware after ~12 frames.
+   * Chunks are staged here and handed to _uvc_process_payload as one payload
+   * when a short transfer marks the payload boundary. */
+  uint8_t bulk_chunked;
+  uint8_t *bulk_chunk_buf;
+  size_t bulk_chunk_got;
+  size_t bulk_chunk_size;
 };
 
 /** Handle on an open UVC device
