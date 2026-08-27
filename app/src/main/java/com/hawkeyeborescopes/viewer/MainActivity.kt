@@ -461,11 +461,16 @@ class MainActivity : CameraActivity() {
 
     override fun onStart() {
         super.onStart()
-        // On resume (not first launch), re-register the camera client.
-        // On first launch, mTextureView isn't available yet — initData()'s
+        // onStop ALWAYS destroys the camera client, so every return from the
+        // background must rebuild it — not only when a camera was open before.
+        // Otherwise: open app -> background trip (screen lock, USB-mode dialog,
+        // task switch) -> plug camera -> Start queries a null client and reports
+        // "No USB camera found" while the camera sits enumerated on the bus,
+        // until the app is fully relaunched.
+        // On first launch mTextureView isn't available yet — initData()'s
         // surface listener handles that case via onSurfaceTextureAvailable.
-        if (wasCameraOpen && mTextureView?.isAvailable == true) {
-            writeLog("onStart: resuming — re-registering camera")
+        if (mTextureView?.isAvailable == true) {
+            writeLog("onStart: resuming — re-registering camera client")
             registerMultiCamera()
         }
     }
